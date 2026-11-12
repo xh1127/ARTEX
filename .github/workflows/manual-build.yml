@@ -1,0 +1,136 @@
+name: Build Windows amd64
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "构建版本号（可留空，例如 v0.3.3）"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  ARTEX_BUILD_VERSION: ${{ inputs.version || format('v0.0.0-manual.{0}.{1}', github.run_number, github.run_attempt) }}
+
+jobs:
+  frontend:
+    name: 构建前端
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 检查版本号
+        shell: bash
+        run: |
+          if [[ ! "$ARTEX_BUILD_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::版本号格式不正确，请填写 v0.3.3、v0.3.3-beta.1 或留空"
+            exit 1
+          fi
+          printf '构建版本：%s\n' "$ARTEX_BUILD_VERSION"
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装前端依赖
+        working-directory: web
+        run: npm ci
+
+      - name: 导出前端静态文件
+        working-directory: web
+        run: npm run build:static
+
+      - name: 保存前端产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/out/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  binaries:
+    name: 构建 Windows amd64
+    needs: frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 下载前端产物
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: server/webui/dist
+
+      - name: 编译并打包
+        shell: bash
+        env:
+          ARTEX_TARGET_OS: windows
+          ARTEX_TARGET_ARCH: amd64
+          ARTEX_SKIP_FRONTEND: "1"
+          ARTEX_SKIP_NPM_CI: "1"
+          ARTEX_COMPRESS: "0"
+          ARTEX_PACKAGE: "1"
+          ARTEX_PACKAGE_DIR: dist
+        run: bash ./build.sh --target "${ARTEX_TARGET_OS}/${ARTEX_TARGET_ARCH}"
+
+      - name: 保存平台压缩包
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-windows-amd64
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  packages:
+    name: 汇总压缩包与校验文件
+    needs: binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 下载 Windows amd64 压缩包
+        uses: actions/download-artifact@v4
+        with:
+          name: pkg-windows-amd64
+          path: dist
+
+      - name: 检查压缩包并生成 SHA256 校验文件
+        working-directory: dist
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(*.zip)
+          if [[ "${#files[@]}" -ne 1 ]]; then
+            echo "::error::预期得到 1 个 Windows amd64 ZIP 包，实际得到 ${#files[@]} 个"
+            exit 1
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: 保存完整下载包
+        uses: actions/upload-artifact@v4
+        with:
+          name: artex-windows-amd64
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
