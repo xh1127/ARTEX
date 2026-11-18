@@ -415,7 +415,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	// Load persisted web-search config (default: off, ddgs).
 	m.webSearchOn = pg.GetBool(settingWebSearchOn, false)
 	if v, ok, _ := pg.GetSetting(settingWebSearchBackend); ok && v != "" {
-		m.webSearchBackend = v
+		m.webSearchBackend = normalizeWebSearchBackend(v)
 	} else {
 		m.webSearchBackend = defaultWebSearchBackend
 	}
@@ -535,17 +535,28 @@ func (m *Manager) SetLLMPoolBindFallback(on bool) error {
 	return m.pg.SetBool(settingLLMPoolBindFallback, on)
 }
 
+// normalizeWebSearchBackend canonicalizes a backend name: trimmed, lower-cased,
+// defaulted when empty. The comparisons downstream are case-sensitive in some
+// places (credential resolution) and case-insensitive in others (the settings
+// test button), so a stored "DeepSeek" used to pass the test and then fail every
+// real search. Normalizing on the way in and out keeps the two in agreement.
+func normalizeWebSearchBackend(backend string) string {
+	backend = strings.ToLower(strings.TrimSpace(backend))
+	if backend == "" {
+		return defaultWebSearchBackend
+	}
+	return backend
+}
+
 // WebSearch returns the current web-search config: whether it is enabled, the
 // backend ("ddgs" | "brave-free" | "tavily"), the Brave API key, the Tavily API
 // key (each empty unless set), and the dedicated egress proxy (empty = direct).
 func (m *Manager) WebSearch() (on bool, backend, braveKey, tavilyKey, proxy string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	backend = m.webSearchBackend
-	if backend == "" {
-		backend = defaultWebSearchBackend
-	}
-	return m.webSearchOn, backend, m.braveKey, m.tavilyKey, m.webSearchProxy
+	// Normalized on read so a value persisted by an older build (or hand-edited
+	// in the settings row) still compares equal on every downstream path.
+	return m.webSearchOn, normalizeWebSearchBackend(m.webSearchBackend), m.braveKey, m.tavilyKey, m.webSearchProxy
 }
 
 // WebSearchOpts returns the config as the agent-package struct the server pushes
@@ -586,10 +597,7 @@ func (m *Manager) deepSeekSearchCreds() (baseURL, apiKey, model, userAgent strin
 // key/proxy; pass a pointer to "" to clear). Callers must rebuild agents (applyLLM)
 // afterwards so the settings take effect.
 func (m *Manager) SetWebSearch(on bool, backend string, braveKey, tavilyKey, proxy *string) error {
-	backend = strings.TrimSpace(backend)
-	if backend == "" {
-		backend = defaultWebSearchBackend
-	}
+	backend = normalizeWebSearchBackend(backend)
 	if err := m.pg.SetBool(settingWebSearchOn, on); err != nil {
 		return err
 	}

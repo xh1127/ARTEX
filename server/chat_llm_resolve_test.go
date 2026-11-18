@@ -38,10 +38,19 @@ func TestChatUnavailableReasonDistinguishesStates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = m.pg.Exec(`UPDATE llm_profiles SET is_default=false WHERE id=$1`, id)
-		_ = m.pg.DeleteProfile(id)
-	})
+	// Must be a defer registered after `defer m.Close()` (LIFO puts it first): a
+	// t.Cleanup runs after the manager already closed the pool, so the delete
+	// silently fails and leaves an ACTIVE profile behind. Every later test that
+	// starts a manager then reloads it, and one of them (TestCoreTaskLifecyclePG)
+	// stops seeding goals because an unrelated task is already active.
+	defer func() {
+		if _, err := m.pg.Exec(`UPDATE llm_profiles SET is_default=false WHERE id=$1`, id); err != nil {
+			t.Logf("cleanup: %v", err)
+		}
+		if err := m.pg.DeleteProfile(id); err != nil {
+			t.Logf("cleanup: %v", err)
+		}
+	}()
 
 	// Profile exists but is not activated.
 	if reason := s.chatUnavailableReason(); !strings.Contains(reason, "没有已激活") {
@@ -81,7 +90,9 @@ func TestResolveChatAgentHonoursConversationProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = m.pg.DeleteProfile(id) })
+	// defer (not t.Cleanup) for the same reason as above: the pool is closed by
+	// `defer m.Close()` before t.Cleanup runs.
+	defer func() { _ = m.pg.DeleteProfile(id) }()
 
 	// A conversation that pinned this profile resolves a chat agent despite the
 	// nil global fallback; without the fix the send precheck rejected it outright.

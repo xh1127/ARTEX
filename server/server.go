@@ -428,9 +428,13 @@ func (s *Server) webSearchOptsFor(cfg agent.Config) agent.WebSearchOpts {
 	return mergeSearchCreds(s.m.WebSearchOpts(), cfg)
 }
 
-// webSearchForCfg is webSearchFor (agent-level on/off gate) plus the cfg rebind.
-func (s *Server) webSearchForCfg(key string, cfg agent.Config) agent.WebSearchOpts {
-	return mergeSearchCreds(s.webSearchFor(key), cfg)
+// searchNeedsProfile reports whether web search borrows an LLM profile's
+// credentials (base URL, key, model, UA) — i.e. whether a per-run resolver is
+// worth installing at all. Reads the cached switch and backend only, so it costs
+// no database work. Any other backend keeps the options captured at build time.
+func (s *Server) searchNeedsProfile() bool {
+	on, backend, _, _, _ := s.m.WebSearch()
+	return on && backend == deepSeekWebSearchBackend
 }
 
 // nonStreamingResolver returns a resolver capturing a profile's streaming choice.
@@ -624,51 +628,63 @@ func (s *Server) providerForProfile(id int64) (llm.Provider, agent.Config, bool)
 // Preserve read errors for hot reload, which must distinguish an unavailable
 // database from a configuration that is known to be unusable.
 func (s *Server) providerForProfileErr(id int64) (llm.Provider, agent.Config, error) {
-	s.provCacheMu.Lock()
-	if e := s.provByProfile[id]; e != nil {
+	// A profile save can bump the generation while this build is in flight, which
+	// discards the result and retries. Bound that: a hot loop of saves must not
+	// recurse (or spin) without limit.
+	const maxAttempts = 8
+	for attempt := 0; ; attempt++ {
+		s.provCacheMu.Lock()
+		if e := s.provByProfile[id]; e != nil {
+			s.provCacheMu.Unlock()
+			return e.prov, e.cfg, nil
+		}
+		generation := s.provCacheGen
 		s.provCacheMu.Unlock()
-		return e.prov, e.cfg, nil
-	}
-	generation := s.provCacheGen
-	s.provCacheMu.Unlock()
-	p, err := s.m.pg.ProfileByID(id)
-	if err != nil {
-		return nil, agent.Config{}, fmt.Errorf("%w: %w", errLLMConfigRead, err)
-	}
-	if p == nil {
-		return nil, agent.Config{}, db.ErrLLMProfileNotFound
-	}
-	cfg := s.configFromProfile(p)
-	if cfg.APIKey == "" {
-		return nil, cfg, fmt.Errorf("配置 %q 未提供 API Key", p.Name)
-	}
-	prov, err := cfg.NewProvider()
-	if err != nil {
-		log.Printf("[engine] build provider for LLM profile %d failed: %v", id, err)
-		return nil, cfg, err
-	}
-	// Use the same snapshot for credentials, recording, and side-model identity.
-	prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, p.Name, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
-	prov = bindSideProvider(prov, cfg, id, p.Name)
-	s.provCacheMu.Lock()
-	if generation != s.provCacheGen {
+		p, err := s.m.pg.ProfileByID(id)
+		if err != nil {
+			return nil, agent.Config{}, fmt.Errorf("%w: %w", errLLMConfigRead, err)
+		}
+		if p == nil {
+			return nil, agent.Config{}, db.ErrLLMProfileNotFound
+		}
+		cfg := s.configFromProfile(p)
+		if cfg.APIKey == "" {
+			return nil, cfg, fmt.Errorf("配置 %q 未提供 API Key", p.Name)
+		}
+		prov, err := cfg.NewProvider()
+		if err != nil {
+			log.Printf("[engine] build provider for LLM profile %d failed: %v", id, err)
+			return nil, cfg, err
+		}
+		// Use the same snapshot for credentials, recording, and side-model identity.
+		prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, p.Name, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
+		prov = bindSideProvider(prov, cfg, id, p.Name)
+		s.provCacheMu.Lock()
+		if generation != s.provCacheGen {
+			s.provCacheMu.Unlock()
+			if attempt < maxAttempts {
+				continue
+			}
+			return nil, agent.Config{}, fmt.Errorf("LLM 配置 %d 在构建期间被连续修改，未能装载；请重试", id)
+		}
+		if e := s.provByProfile[id]; e != nil { // lost the race → keep the winner
+			prov, cfg = e.prov, e.cfg
+		} else {
+			s.provByProfile[id] = &provEntry{prov: prov, cfg: cfg}
+			log.Printf("[engine] built provider for LLM profile %d (%s / %s)", id, cfg.Provider(), cfg.Model)
+		}
 		s.provCacheMu.Unlock()
-		return s.providerForProfileErr(id)
+		return prov, cfg, nil
 	}
-	if e := s.provByProfile[id]; e != nil { // lost the race → keep the winner
-		prov, cfg = e.prov, e.cfg
-	} else {
-		s.provByProfile[id] = &provEntry{prov: prov, cfg: cfg}
-		log.Printf("[engine] built provider for LLM profile %d (%s / %s)", id, cfg.Provider(), cfg.Model)
-	}
-	s.provCacheMu.Unlock()
-	return prov, cfg, nil
 }
 
 // chatAgentForProfile returns a ChatAgent built from a specific LLM profile, cached
 // per profile id. Returns nil if the profile is missing or has no API key.
 func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
-	for {
+	// Same bound as providerForProfileErr: a hot loop of profile saves keeps
+	// invalidating the generation, and an unbounded retry would spin here.
+	const maxAttempts = 8
+	for attempt := 0; ; attempt++ {
 		s.profMu.Lock()
 		cached := s.profChatAgents[id]
 		generation := s.profCacheGen
@@ -691,7 +707,10 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 		s.profMu.Lock()
 		if generation != s.profCacheGen {
 			s.profMu.Unlock()
-			continue // A profile changed while this agent was being built.
+			if attempt < maxAttempts {
+				continue // A profile changed while this agent was being built.
+			}
+			return nil // gave up instead of spinning: callers treat nil as "unavailable" and fall back to the global agent
 		}
 		if ex := s.profChatAgents[id]; ex != nil { // lost the race → keep the winner
 			ca = ex
@@ -3533,10 +3552,9 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.WebSearchBackend != nil {
-		*req.WebSearchBackend = strings.TrimSpace(*req.WebSearchBackend)
-		if *req.WebSearchBackend == "" {
-			*req.WebSearchBackend = defaultWebSearchBackend
-		}
+		// Same canonical form as SetWebSearch/WebSearch, so what gets persisted,
+		// what lands in memory, and what the comparison sites see all agree.
+		*req.WebSearchBackend = normalizeWebSearchBackend(*req.WebSearchBackend)
 	}
 	if req.PythonInterp != nil {
 		*req.PythonInterp = strings.TrimSpace(*req.PythonInterp)

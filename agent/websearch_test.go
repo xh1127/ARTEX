@@ -148,3 +148,17 @@ func TestReadDeepSeekSearch(t *testing.T) {
 		})
 	}
 }
+
+// configureWebSearch appends its tool AFTER AugmentTools has already wrapped
+// everything in guardPanic, so it must apply the wrapper itself — otherwise
+// web_search is the one tool a panic can still take the process down through.
+func TestWebSearchIsPanicGuarded(t *testing.T) {
+	var opts agentcore.Options
+	configureWebSearch(&opts, WebSearchOpts{Enabled: true, Backend: "ddgs"})
+	if len(opts.Tools) != 1 {
+		t.Fatalf("tools=%d", len(opts.Tools))
+	}
+	if _, ok := opts.Tools[0].(*guardedTool); !ok {
+		t.Fatalf("web_search added without guardPanic: %T", opts.Tools[0])
+	}
+}

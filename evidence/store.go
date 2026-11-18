@@ -107,12 +107,9 @@ func (s *Store) writeBody(r io.Reader, expectedLength int64, expectedHash string
 	if err = os.Rename(f.Name(), path); err != nil {
 		return "", err
 	}
-	d, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return "", err
-	}
-	defer d.Close()
-	return hash, d.Sync()
+	// Durability barrier for the rename itself. Only meaningful where fsync on a
+	// directory is supported — see syncDir's platform split.
+	return hash, syncDir(filepath.Dir(path))
 }
 
 // StageFindingsExport freezes bindings/report versions and makes private body

@@ -44,7 +44,9 @@ func configureWebSearch(opts *agentcore.Options, search WebSearchOpts) {
 		log.Printf("[web_search] 已启用但未返回工具（backend=%q）", search.Backend)
 		return
 	}
-	opts.Tools = append(opts.Tools, t)
+	// AugmentTools wraps every tool it assembles in guardPanic, but this one is
+	// appended afterwards, so it would be the only tool without panic protection.
+	opts.Tools = append(opts.Tools, guardPanic(t))
 }
 
 func newWebSearch(o WebSearchOpts) (actool.CoreTool, error) {

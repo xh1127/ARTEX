@@ -11,14 +11,26 @@
 - **DeepSeek 联网搜索用错配置（费用与 UA 串号）**：搜索后端没有自己的密钥，一直借用「当前激活的配置」的 base_url / key / model。于是被 pin 到便宜配置的任务，搜索请求却走了另一个配置的额度；由于自定义 User-Agent 与密钥在同一个请求上，网关按 UA 分组的风控与限流也会跟着错位。现改为按**调用方实际使用的配置**解析（agent 绑定 → 任务配置链的激活项 → 全局），任务链中途切换配置时逐轮跟随，构建时快照不再是唯一来源。
 - **自定义 UA 非法时 `web_search` 静默消失**：`configureWebSearch` 构建失败不记日志，工具凭空不见，与「后端未启用」无法区分。而最可能的成因正是从激活配置继承来的 UA 不合法。现改为失败时打印 backend 与原因，并显式拦住「构建成功但没有工具」的情况。
 - **`ProbeWebSearch` 的裸类型断言**改为安全断言，断言失败时返回明确错误而不是 panic。
-- **`applyLLM` 的重建重试无上限**：并发修改配置时理论上是忙等。现限定 8 次，超出返回可重试的错误，不再自旋。
+- **`applyLLM` 的重建重试无上限**：并发修改配置时理论上是忙等。现限定 8 次，超出返回可重试的错误，不再自旋。同一模式还存在于 `providerForProfileErr`（递归，热保存时会累积栈帧）与 `chatAgentForProfile`（`for` 循环），一并加上同样的上限。
 - 修正 `reapplyActiveProfile` 中与实际行为不符的注释（`s.llmCfg` 是上次装载的结果，不是环境变量）。
+- **`web_search` 是唯一没有 panic 兜底的工具**：`configureWebSearch` 在 `AugmentTools` 之后 append，而 `guardPanic` 已在装配阶段执行完毕。现自身包一层，避免它的 handler panic 直接带走进程。
+- **搜索已关闭 / 非 DeepSeek 时每轮多跑两次数据库查询**：按 run 解析搜索凭据的改写让 resolver 无条件求值，即使结果会被丢弃。现改为只在 DeepSeek 后端生效时才安装 resolver，关闭搜索与其它后端不再付这笔开销。
+- **backend 名大小写不一致**：凭据解析用精确比较，而「测试」按钮与 agent 侧用 `EqualFold`，于是存成 `DeepSeek` 时测试通过、真实搜索却拿不到密钥。现统一在读写两侧归一化为小写，并补回归测试。
+
+### 证据与技能
+
+#### 修复的问题
+
+- **Windows 上无法写入证据正文（严重）**：`evidence.writeBody` 在 rename 之后对**目录**调用 `fsync` 作为持久化屏障，而 Win32 不支持该操作，直接返回 `Access is denied`，导致绑定流量证据、导出与归档全部失败。现按平台拆出 `syncDir`：POSIX 保持目录 fsync，Windows 为显式 no-op（rename 本身已由文件系统日志保证持久）。
+- **`skillRelPath` 在 Windows 上把路径分隔符改成反斜杠**：输入是客户端传来的斜杠分隔相对路径，却用 `filepath.Clean` 归一化，于是前端拿到 `scripts\run.py` 后再请求文件即 404。现改用 `path.Clean`，返回值与平台无关。
+- **`TestCoreTaskLifecyclePG` 隔离缺陷**：`TestChatUnavailableReasonDistinguishesStates` 用 `defer m.Close()` 关库，先于 `t.Cleanup` 执行，清理静默失败并残留一条**激活状态**的配置；后续测试启动管理器时重新装载它，导致新任务抢不到 active、goal 节点一个都不种，断言失败。现改为在 `defer m.Close()` 之前注册 `defer` 清理（与 `llmrec_raw_test.go` 已有写法一致）。
+- **`llmrec` 的用量计量测试依赖他包建表**：该测试直接 `db.Open`，而 `llm_usage` 由 `Manager` 启动时创建，因此只有在别的包先跑过时才通过。现自行调用 `EnsureLLMUsageTable` 建立依赖。
 
 ### 构建与测试
 
 #### 新增的功能
 
-- **新增 `test` workflow**：带 `postgres:16` service 跑 `go vet` + `go test`（当前为 `continue-on-error`，待下述测试隔离缺陷修好后转为阻断），以及前端 `tsc --noEmit` + `biome check`。
+- **新增 `test` workflow**：带 `postgres:16` service 跑 `go vet` + `go test`（阻断），以及前端 `tsc --noEmit`（阻断）和 `biome check`（暂为 `continue-on-error`：仓库既有 135 个错误 / 138 条警告，均不在本分支改动的文件里，清理后再转阻断）。
 - **`release.yml` 的 Go 版本改读 `go.mod`**：原来写死 `"1.26"`，可能解析到低于 `go.mod` 要求的补丁版本，从而在交叉编译中途触发第二次 toolchain 下载。
 
 ## [0.3.15] - 2026-10-07

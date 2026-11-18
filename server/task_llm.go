@@ -572,13 +572,18 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	// DeepSeek search borrows the key/base/UA of an LLM profile, so it must follow
 	// whatever profile this task is running on right now (chain advance, failover).
-	wk.SetWebSearchResolver(func() agent.WebSearchOpts {
-		cfg, ok := workerRuntime.activeCfg()
-		if !ok {
-			return s.webSearchFor("worker")
-		}
-		return s.webSearchForCfg("worker", cfg)
-	})
+	// Installed only when that borrowing is actually in play: otherwise the
+	// build-time value above is final, and a resolver would add a task read plus a
+	// provider lookup to every single run for nothing.
+	if s.searchNeedsProfile() {
+		wk.SetWebSearchResolver(func() agent.WebSearchOpts {
+			cfg, ok := workerRuntime.activeCfg()
+			if !ok {
+				return s.webSearchFor("worker")
+			}
+			return mergeSearchCreds(s.webSearchFor("worker"), cfg)
+		})
+	}
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
 	pl.SetFindingRecorder(s.evidenceStore())
@@ -590,13 +595,15 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetSteerWork(s.engine.SteerWork)
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	pl.SetWebSearch(s.webSearchFor("planner"))
-	pl.SetWebSearchResolver(func() agent.WebSearchOpts {
-		cfg, ok := plannerRuntime.activeCfg()
-		if !ok {
-			return s.webSearchFor("planner")
-		}
-		return s.webSearchForCfg("planner", cfg)
-	})
+	if s.searchNeedsProfile() {
+		pl.SetWebSearchResolver(func() agent.WebSearchOpts {
+			cfg, ok := plannerRuntime.activeCfg()
+			if !ok {
+				return s.webSearchFor("planner")
+			}
+			return mergeSearchCreds(s.webSearchFor("planner"), cfg)
+		})
+	}
 	pl.SetConstraintInject(s.constraintInjectPlanner) // 操作约束注入 planner(可配置,默认开)
 	// cold-digest §7: 冷节点后台压缩。引擎经权威解析器实际驱动的就是这套 per-task planner
 	// (agentsForTask),Compactor 必须接在这里。走任务路由的 planner provider(§4:与 agent
@@ -610,13 +617,15 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	main.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	main.SetWebSearch(s.webSearchFor("mainagent"))
-	main.SetWebSearchResolver(func() agent.WebSearchOpts {
-		cfg, ok := mainRuntime.activeCfg()
-		if !ok {
-			return s.webSearchFor("mainagent")
-		}
-		return s.webSearchForCfg("mainagent", cfg)
-	})
+	if s.searchNeedsProfile() {
+		main.SetWebSearchResolver(func() agent.WebSearchOpts {
+			cfg, ok := mainRuntime.activeCfg()
+			if !ok {
+				return s.webSearchFor("mainagent")
+			}
+			return mergeSearchCreds(s.webSearchFor("mainagent"), cfg)
+		})
+	}
 	main.SetSteerWork(s.engine.SteerWork) // steer_work：人对运行中 work 实时纠偏
 	bundle := &taskAgentBundle{
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,

@@ -92,6 +92,12 @@ func TestSideUsageRecordedOnceOnConsumerCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pg.Close()
+	// llm_usage is created by Manager's startup, not by db.Open, so a run where
+	// no other package initialised the shared database first used to fail with
+	// "relation llm_usage does not exist". Create it here to stay independent.
+	if err := pg.EnsureLLMUsageTable(); err != nil {
+		t.Fatalf("ensure llm_usage: %v", err)
+	}
 	for _, early := range []bool{false, true} {
 		profile := "btw-metering-" + uuid.NewString()
 		ctx, cancel := context.WithCancel(transcript.WithSessionID(t.Context(), "exp0-btw-test"))
