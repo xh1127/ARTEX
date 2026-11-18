@@ -1,10 +1,12 @@
 # ARTEX 开发交接文档（换机迁移）
 
 > 生成时间：2026-11-18 · 来源机器：Windows 10 Pro (win32, Git Bash)
-> 源工作区：`D:\code\ARTEX` · 分支 `main` · HEAD `51291fe Create manual-build.yml`
-> 上游：`origin` → `https://gh-proxy.org/https://github.com/xh1127/ARTEX.git`
+> 源工作区：`D:\code\ARTEX` · 基线 `main` @ `51291fe`
+> **工作分支：`handoff/llm-user-agent` @ `608bb58`（已推送）**
+> 远端：`github` → `https://github.com/xh1127/ARTEX.git`（可写，分支跟踪它）
+>       `origin` → `https://gh-proxy.org/https://github.com/xh1127/ARTEX.git`（只读镜像，`main` 跟踪它）
 
-这份文档解决三件事：**带什么走**、**新机器怎么起来**、**当前手上没提交的活是什么**。
+这份文档解决三件事：**代码在哪**、**新机器怎么起来**、**接下来该做什么**。
 
 ---
 
@@ -12,7 +14,7 @@
 
 | 要做的事 | 命令 / 说明 |
 |---|---|
-| 带走代码 | 推荐 `git push`（见 §2-A）；不行就用仓库根的 `artex-wip.patch`（见 §2-B，已实测可干净应用） |
+| 拿到代码 | `git clone https://github.com/xh1127/ARTEX.git && cd ARTEX && git switch handoff/llm-user-agent`（见 §2-A） |
 | **不要**带的东西 | `web/node_modules/`、`web/.next/`、`web/out/`、`data/`、`config.json`、`.env`、`jwt.key`、`artex` 二进制 |
 | 新机器装什么 | Go **1.26.3+**、Node **20+**（本机实测 v24.19.0）、PostgreSQL **16**、git |
 | 起来跑什么 | `cp config.example.json config.json` 填库 → `./dev.sh` |
@@ -40,45 +42,44 @@
 
 ## 2. 代码怎么带过去
 
-### 方案 A（推荐）：走 git
+代码已经推到 `xh1127/ARTEX` 的 **`handoff/llm-user-agent`** 分支（提交 `608bb58`，30 个文件 +2536/−370）。不要再从旧工作区拷贝。
+
+### 方案 A（推荐）：直接克隆分支
 
 ```bash
-# 源机器：当前 28 个文件的改动先落到一个分支
-git switch -c feat/llm-user-agent
-git add -A
-git commit -m "feat(llm): per-profile User-Agent + settings txn + provider hot-reload hardening"
-git push -u origin feat/llm-user-agent
+git clone https://github.com/xh1127/ARTEX.git
+cd ARTEX
+git switch handoff/llm-user-agent
 ```
 
+新机器访问 GitHub 慢时，先用镜像克隆、再补一个直连远端取分支：
+
 ```bash
-# 新机器
 git clone https://gh-proxy.org/https://github.com/xh1127/ARTEX.git
 cd ARTEX
-git switch feat/llm-user-agent
+git remote add github https://github.com/xh1127/ARTEX.git
+git fetch github handoff/llm-user-agent
+git switch handoff/llm-user-agent
 ```
 
-> 若不想推上游仓库，也可以在源机器 `git bundle create ../artex.bundle --all`，新机器 `git clone artex.bundle ARTEX`。bundle 是单个文件、含完整历史，比拷 `.git` 目录稳。
+> **注意 `origin` 是只读的。** `gh-proxy.org` 只做拉取镜像，`git push origin` 会报
+> `remote: No anonymous write access.`。推送必须用 `github` 这个远端：
+> `git push -u github handoff/llm-user-agent`。
 
-### 方案 B（备用）：用已生成的补丁
+### 方案 B（备用）：用补丁 / bundle
 
-仓库根已有 `artex-wip.patch`（141 KB，**28 个文件**，含 9 个新增文件）。
-
-它是用 `git diff --binary` 在 `git add -N`（intent-to-add）之后生成的，因此**新增文件也包含在内**。已在干净的 `HEAD` 检出上实测：
-
-```
-git apply --check artex-wip.patch   → APPLY_CHECK_OK
-git apply      artex-wip.patch      → 28 files changed
-```
-
-新机器上：
+仓库根可能还留着 `artex-wip.patch`（141 KB，28 个文件，含 9 个新增文件）。它现在**已被 `.gitignore` 的 `/*.patch` 覆盖**，不会被误提交。
 
 ```bash
+# 补丁只能叠在基线提交上
 git clone <仓库> && cd ARTEX
-git checkout 51291fe            # 必须正好是这个提交，补丁基于它
+git checkout 51291fe            # 补丁基于这个提交，别叠到分支上
 git apply artex-wip.patch
 ```
 
-**用完请删除 `artex-wip.patch`**——它没有被 `.gitignore` 覆盖，很容易被 `git add -A` 顺手提交进去。或者自己加一行 `/artex-wip.patch` 到 `.gitignore`。
+该补丁已在干净 `HEAD` 检出上实测过 `git apply --check` 通过、应用后 28 个文件全部落地。但**它不含后来那次提交里对 `.gitignore` 与 `HANDOFF.md` 的改动**，所以只在前述克隆方式不可用时才用它。
+
+更稳的离线方式：源机器 `git bundle create ../artex-handoff.bundle handoff/llm-user-agent`，新机器 `git clone artex-handoff.bundle ARTEX`。
 
 ### 方案 C：整个目录拷贝
 
@@ -173,15 +174,15 @@ npm run check          # biome check
 测试基建有两个关键点，不知道会踩坑：
 
 - **需要独立测试库**：`db`、`agent`、`server`、`evidence` 四个包都有 `TestMain`，会在 `ARTEX_PG_DSN` 指向的库上取 **PostgreSQL 咨询锁 7337741002** 来串行化跨包清理（`server/testmain_test.go`、`db/testmain_test.go` 等）。所以**别指向生产库**，测试会 `DELETE` 数据。
-- **静默跳过**：`requestHeadersDatabase()`（`server/llm_request_headers_test.go:14`）在 DSN 为空时 `t.Skip`。本次改动新增的 8 个测试文件几乎全靠它，因此**没设 DSN 就等于没测**。
+- **静默跳过**：`requestHeadersDatabase()`（`server/llm_request_headers_test.go:14`）在 DSN 为空时 `t.Skip`。新增的 9 个测试文件几乎全靠它，因此**没设 DSN 就等于没测**。
 
 > CI 现状：`.github/workflows/` 只有 `release.yml`（打 tag 时构建五平台）和 `manual-build.yml`（手工构建 Windows amd64），**两个都没有 `go test` 步骤**。想在 CI 上跑测试需要自己加一个带 `postgres:16` service 的 job。
 
 ---
 
-## 5. 当前未提交的改动（28 个文件，+2206 / −370）
+## 5. 分支 `handoff/llm-user-agent` 里有什么
 
-这是换机后**第一件要接着做的事**。改动是一条主线加三块顺带加固：
+提交 `608bb58`，30 个文件，+2536 / −370。一条主线加四块顺带加固：
 
 ### 5.1 主线：LLM 配置支持自定义 User-Agent
 
@@ -322,6 +323,6 @@ git 会大量提示 `LF will be replaced by CRLF the next time Git touches it`�
 3. 起库、写 `config.json`
 4. **跑 §4 的验收**——特别是带 `ARTEX_PG_DSN` 的 `go test ./...`，这是本次改动第一次真正被验证
 5. `./dev.sh` 起来，走 `/setup` → 配 LLM → 在「LLM 配置」页验证 UA 字段（连接测试 + 加载模型都应带新 UA）
-6. 把 §5 的 28 个文件整理成一个提交；补 `CHANGELOG.md` 的 `[Unreleased]`
-7. 按 §6 处理高优先级三条
-8. 删除 `artex-wip.patch`，或加进 `.gitignore`
+6. 补 `CHANGELOG.md` 的 `[Unreleased]`（分支上的改动量与 0.3.15 任一条相当）
+7. 按 §6 处理高优先级三条；其中第 2 条（CI 跑测试）建议最先做
+8. 验证通过后合入 `main`，推送用 `git push github main`（`origin` 只读）
