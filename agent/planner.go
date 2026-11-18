@@ -38,6 +38,7 @@ type Planner struct {
 	nonStreamingFn    func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn      func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn       func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
+	webSearchFn       func() WebSearchOpts                   // resolver: search opts per run (nil = use webSearch)
 	compactor         *Compactor                             // cold-node compaction (§7); nil = disabled
 
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
@@ -94,6 +95,18 @@ func (p *Planner) SetProxy(addr, caCert string) { p.proxyAddr, p.proxyCACert = a
 
 // SetWebSearch selects the web_search backend for the planner (off by default).
 func (p *Planner) SetWebSearch(o WebSearchOpts) { p.webSearch = o }
+
+// SetWebSearchResolver wires a per-run resolver for the search options, so a
+// task that switches LLM profiles mid-run searches with the profile it actually
+// uses (its credentials and UA ride on the same request). nil = use SetWebSearch.
+func (p *Planner) SetWebSearchResolver(fn func() WebSearchOpts) { p.webSearchFn = fn }
+
+func (p *Planner) searchOpts() WebSearchOpts {
+	if p.webSearchFn == nil {
+		return p.webSearch
+	}
+	return p.webSearchFn()
+}
 
 // SetConstraintInject wires a resolver deciding whether this task's operation
 // constraints get injected into the planner system prompt. Read per round so the
@@ -428,7 +441,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		NonStreaming: p.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:    p.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
 	}
-	configureWebSearch(&opts, p.webSearch)
+	configureWebSearch(&opts, p.searchOpts())
 	if p.tx != nil { // persist raw LLM conversation; one accumulating file per task's planner
 		opts.Transcript = p.tx
 		opts.SessionID = fmt.Sprintf("exp%d-planner", ts.ID())

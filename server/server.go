@@ -380,7 +380,11 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 // happens inside applyLLM's serialization, never from an earlier DB snapshot.
 func (s *Server) reapplyActiveProfile() error {
 	s.cfgMu.Lock()
-	cfg := s.llmCfg // environment fallback when there is no persisted selection
+	// The last applied config, NOT the environment. applyLLM re-reads the active
+	// profile from the DB and only falls back to this value when no profile is
+	// active — which is exactly the startup env-config case and the post-delete
+	// case where nothing else remains.
+	cfg := s.llmCfg
 	s.cfgMu.Unlock()
 	if err := s.applyLLM(cfg); err != nil {
 		log.Printf("[engine] reapply active profile failed: %v", err)
@@ -397,6 +401,36 @@ func (s *Server) webSearchFor(key string) agent.WebSearchOpts {
 		o.Enabled = false
 	}
 	return o
+}
+
+// mergeSearchCreds replaces the DeepSeek backend's borrowable credentials with
+// the ones from cfg — the LLM config the caller actually runs on. Search has no
+// key of its own: it borrows an LLM profile's base URL, key, model, and UA. A
+// chat or task bound to a specific profile must therefore search AS THAT
+// profile. Using the globally active one instead puts another profile's key on
+// the request, and because the UA rides along, another profile's User-Agent too
+// — which is exactly what a UA-keyed gateway groups and rate-limits on.
+// cfg that cannot serve a search (no key/base/model) leaves the fallback intact.
+func mergeSearchCreds(o agent.WebSearchOpts, cfg agent.Config) agent.WebSearchOpts {
+	if o.Backend != deepSeekWebSearchBackend {
+		return o
+	}
+	if cfg.BaseURL == "" || cfg.APIKey == "" || cfg.Model == "" {
+		return o
+	}
+	o.DeepSeekBaseURL, o.DeepSeekAPIKey, o.DeepSeekModel = cfg.BaseURL, cfg.APIKey, cfg.Model
+	o.DeepSeekUserAgent = cfg.UserAgent
+	return o
+}
+
+// webSearchOptsFor is WebSearchOpts for a role that already resolved its LLM config.
+func (s *Server) webSearchOptsFor(cfg agent.Config) agent.WebSearchOpts {
+	return mergeSearchCreds(s.m.WebSearchOpts(), cfg)
+}
+
+// webSearchForCfg is webSearchFor (agent-level on/off gate) plus the cfg rebind.
+func (s *Server) webSearchForCfg(key string, cfg agent.Config) agent.WebSearchOpts {
+	return mergeSearchCreds(s.webSearchFor(key), cfg)
 }
 
 // nonStreamingResolver returns a resolver capturing a profile's streaming choice.
@@ -419,7 +453,11 @@ func maxTokensResolver(cfg agent.Config) func() int {
 func (s *Server) applyLLM(cfg agent.Config) error {
 	s.llmApplyMu.Lock()
 	defer s.llmApplyMu.Unlock()
-	for {
+	// A concurrent settings save can invalidate the generation mid-build. Retry a
+	// bounded number of times: the lock already serializes builders, so a build
+	// that keeps losing can only mean a hot loop of saves, which must not spin.
+	const maxAttempts = 8
+	for attempt := 0; ; attempt++ {
 		s.profMu.Lock()
 		generation := s.profCacheGen
 		s.profMu.Unlock()
@@ -442,7 +480,12 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 		s.profMu.Lock()
 		if generation != s.profCacheGen {
 			s.profMu.Unlock()
-			continue // A profile/settings change invalidated this build.
+			if attempt < maxAttempts {
+				continue // A profile/settings change invalidated this build.
+			}
+			// Give up rather than spin. The persisted state is untouched, so the
+			// calling request can report a retryable failure and save again.
+			return fmt.Errorf("LLM 配置在构建期间被连续修改 %d 次，未能装载；请重试", maxAttempts)
 		}
 		if errors.Is(err, errLLMConfigRead) {
 			// A failed read tells us nothing about the saved configuration. Keep
@@ -640,7 +683,7 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 		tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
 		ca := agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
 		ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
-		ca.SetWebSearch(s.m.WebSearchOpts())
+		ca.SetWebSearch(s.webSearchOptsFor(cfg)) // search as THIS profile, not the active one
 		ca.SetGuard(s.chatGuard())
 		ca.SetNonStreaming(nonStreamingResolver(cfg))
 		ca.SetMaxTokens(maxTokensResolver(cfg))

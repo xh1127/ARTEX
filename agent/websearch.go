@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -25,14 +26,25 @@ func (o WebSearchOpts) sdkConfig() actool.WebSearchConfig {
 // configureWebSearch keeps all agent roles on the same search implementation.
 // The SDK does not expose a search HTTP client/header hook, so DeepSeek uses a
 // local runner while retaining the SDK tool's schema and permission checks.
+//
+// A build failure is logged rather than swallowed: the tool simply vanishing is
+// indistinguishable from "the backend is off", and the most likely cause — an
+// invalid User-Agent inherited from the active LLM profile — would otherwise
+// leave the operator guessing.
 func configureWebSearch(opts *agentcore.Options, search WebSearchOpts) {
 	if !search.Enabled {
 		return
 	}
 	t, err := newWebSearch(search)
-	if err == nil { // Match the SDK's behavior for an incomplete backend config.
-		opts.Tools = append(opts.Tools, t)
+	if err != nil {
+		log.Printf("[web_search] 已启用但构建失败，本轮不提供该工具（backend=%q）: %v", search.Backend, err)
+		return
 	}
+	if t == nil { // a backend that reports success but yields no tool
+		log.Printf("[web_search] 已启用但未返回工具（backend=%q）", search.Backend)
+		return
+	}
+	opts.Tools = append(opts.Tools, t)
 }
 
 func newWebSearch(o WebSearchOpts) (actool.CoreTool, error) {
@@ -77,10 +89,14 @@ func ProbeWebSearch(ctx context.Context, o WebSearchOpts, query string, limit in
 	if err != nil {
 		return nil, err
 	}
+	ds, ok := t.(*deepSeekSearchTool)
+	if !ok || ds == nil {
+		return nil, fmt.Errorf("web_search: deepseek backend did not build a search runner")
+	}
 	if limit <= 0 {
 		limit = 3
 	}
-	return t.(*deepSeekSearchTool).search(ctx, query, min(limit, 20))
+	return ds.search(ctx, query, min(limit, 20))
 }
 
 type deepSeekSearchTool struct {

@@ -86,6 +86,10 @@ type Worker struct {
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
+	// webSearchFn re-resolves the search options each run so the DeepSeek backend
+	// borrows the credentials and UA of the profile this run actually uses.
+	// Read per run, like nonStreaming. nil = use the webSearch captured at build.
+	webSearchFn func() WebSearchOpts
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -191,6 +195,19 @@ func (w *Worker) SetProxy(addr, caCert string) { w.proxyAddr, w.proxyCACert = ad
 
 // SetWebSearch selects the web_search backend for this worker (off by default).
 func (w *Worker) SetWebSearch(o WebSearchOpts) { w.webSearch = o }
+
+// SetWebSearchResolver wires a per-run resolver for the search options. A task
+// whose LLM profile changes mid-run (failover, chain advance) must search with
+// the profile it is actually using, not the one captured when the agent was
+// built. nil = keep the value from SetWebSearch.
+func (w *Worker) SetWebSearchResolver(fn func() WebSearchOpts) { w.webSearchFn = fn }
+
+func (w *Worker) searchOpts() WebSearchOpts {
+	if w.webSearchFn == nil {
+		return w.webSearch
+	}
+	return w.webSearchFn()
+}
 
 // proxyEnv builds the Bash-subprocess env that routes child-command HTTP through
 // the egress proxy (the recording MITM when capture is on, or the global proxy
@@ -459,7 +476,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		NonStreaming:  w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:     w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
 	}
-	configureWebSearch(&opts, w.webSearch)
+	configureWebSearch(&opts, w.searchOpts())
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks
 	}

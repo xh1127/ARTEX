@@ -33,6 +33,7 @@ type MainAgent struct {
 	nonStreamingFn  func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn    func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn     func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
+	webSearchFn     func() WebSearchOpts                   // resolver: search opts per run (nil = use webSearch)
 }
 
 // SetNoaEnabled wires a resolver deciding whether runs use the experimental noa
@@ -76,6 +77,18 @@ func (m *MainAgent) SetProxy(addr, caCert string) { m.proxyAddr, m.proxyCACert =
 
 // SetWebSearch selects the web_search backend for the main agent (off by default).
 func (m *MainAgent) SetWebSearch(o WebSearchOpts) { m.webSearch = o }
+
+// SetWebSearchResolver wires a per-run resolver for the search options, so a
+// task that switches LLM profiles mid-run searches with the profile it actually
+// uses (its credentials and UA ride on the same request). nil = use SetWebSearch.
+func (m *MainAgent) SetWebSearchResolver(fn func() WebSearchOpts) { m.webSearchFn = fn }
+
+func (m *MainAgent) searchOpts() WebSearchOpts {
+	if m.webSearchFn == nil {
+		return m.webSearch
+	}
+	return m.webSearchFn()
+}
 
 // SetSteerWork wires the engine callback that lets the main agent's steer_work
 // tool inject a mid-run course-correction into a running work (nil = tool off).
@@ -154,7 +167,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		NonStreaming: m.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:    m.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
 	}
-	configureWebSearch(&opts, m.webSearch)
+	configureWebSearch(&opts, m.searchOpts())
 	if m.tx != nil { // persist raw human↔AI conversation; one accumulating file per segment
 		opts.Transcript = m.tx
 		// Segment 0 keeps the legacy "exp%d-main" name so existing transcripts still
