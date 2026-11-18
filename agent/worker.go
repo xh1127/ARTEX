@@ -29,7 +29,7 @@ import (
 // agent (planner/worker/main). Enabled=false leaves the web_search tool off.
 // Backend is "ddgs" (no key), "brave-free" (BraveKey required), "tavily"
 // (TavilyKey required), or "deepseek" (DeepSeek* required, filled from the
-// active LLM profile). It maps directly onto agentcore.Options.
+// active LLM profile). configureWebSearch installs the matching tool.
 // Proxy is a dedicated egress proxy for the search request (http/https/socks5),
 // independent of the traffic-recording MITM proxy — set it when the search endpoint
 // is only reachable via a VPN/SOCKS proxy. Empty = direct.
@@ -46,9 +46,10 @@ type WebSearchOpts struct {
 	Proxy     string
 	// DeepSeek* 来自当前激活的 LLM 配置(仅 anthropic 格式的 DeepSeek 官方端点)，
 	// 不单独配置，随 LLM 配置切换而变。
-	DeepSeekBaseURL string
-	DeepSeekAPIKey  string
-	DeepSeekModel   string
+	DeepSeekBaseURL   string
+	DeepSeekAPIKey    string
+	DeepSeekModel     string
+	DeepSeekUserAgent string
 }
 
 type Worker struct {
@@ -439,16 +440,6 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		EnableWebFetch: true,
 		WebFetchProxy:  w.proxyAddr,
 		WebFetchCACert: w.proxyCACert,
-		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
-		// WebSearchProxy 是独立的出口代理(http/https/socks5)，与记录流量的 MITM 代理无关；空则直连。
-		EnableWebSearch:       w.webSearch.Enabled,
-		WebSearchBackend:      w.webSearch.Backend,
-		BraveSearchAPIKey:     w.webSearch.BraveKey,
-		TavilySearchAPIKey:    w.webSearch.TavilyKey,
-		DeepSeekSearchBaseURL: w.webSearch.DeepSeekBaseURL,
-		DeepSeekSearchAPIKey:  w.webSearch.DeepSeekAPIKey,
-		DeepSeekSearchModel:   w.webSearch.DeepSeekModel,
-		WebSearchProxy:        w.webSearch.Proxy,
 		// Bash 子命令的 HTTP 默认走记录代理 + 信任其 CA（工具无需 -x/-k）。
 		BashEnv:    proxyEnv(w.proxyAddr, w.proxyCACert),
 		WorkingDir: runDir,
@@ -468,6 +459,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		NonStreaming:  w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:     w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
 	}
+	configureWebSearch(&opts, w.webSearch)
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks
 	}

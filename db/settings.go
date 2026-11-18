@@ -1,6 +1,10 @@
 package db
 
-import "database/sql"
+import (
+	"context"
+	"database/sql"
+	"sort"
+)
 
 // Settings is a tiny key-value store for global app config the UI toggles at
 // runtime (e.g. traffic_capture). Missing keys fall back to caller defaults.
@@ -23,6 +27,31 @@ func (d *DB) SetSetting(key, value string) error {
 INSERT INTO settings(key, value) VALUES ($1, $2)
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, key, value)
 	return err
+}
+
+// SetSettings commits a settings patch atomically, so a failed write cannot
+// leave a partially applied request. Stable key order avoids lock inversion.
+func (d *DB) SetSettings(ctx context.Context, values map[string]string) error {
+	if len(values) == 0 {
+		return nil
+	}
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO settings(key, value) VALUES ($1, $2)
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, key, values[key]); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // InsertSettingIfAbsent 只在 key 尚未存在时写入，已存在则原样保留并返回 inserted=false。

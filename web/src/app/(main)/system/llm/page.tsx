@@ -39,6 +39,16 @@ import { ProfileRetryFields, RetryPolicyPanel, ZERO_OVERRIDE } from "./_componen
 const NONE = "none";
 const fromStore = (v?: string) => (v ? v : NONE);
 const toStore = (v: string) => (v === NONE ? "" : v);
+// Fixed, editable examples; these versions do not track installed agent versions.
+const USER_AGENT_PRESETS = [
+  // https://unpkg.com/@anthropic-ai/claude-code@2.1.0/cli.js
+  { id: "claude-code", label: "Claude Code", value: "claude-cli/2.1.0 (external, cli)" },
+  // Product token; OS / terminal details are optional in this editable example.
+  // https://github.com/openai/codex/blob/rust-v0.104.0/codex-rs/core/src/default_client.rs
+  { id: "codex-cli", label: "Codex CLI", value: "codex_cli_rs/0.104.0" },
+  // https://github.com/anomalyco/opencode/blob/v1.2.0/packages/opencode/src/session/llm.ts
+  { id: "opencode", label: "OpenCode", value: "opencode/1.2.0" },
+];
 const THINKING_TYPES: { value: string; label: string }[] = [
   { value: NONE, label: "不发送（默认）" },
   { value: "disabled", label: "关闭" },
@@ -328,6 +338,7 @@ function ProfileSheet({
   const [maxTokens, setMaxTokens] = React.useState("0"); // 单次回复输出上限;0=不发送
   const [maxTokensField, setMaxTokensField] = React.useState(NONE); // 上限用哪个字段名;NONE=max_tokens
   const [sessionHeaderKey, setSessionHeaderKey] = React.useState(""); // 自定义会话头名;空=不发送
+  const [userAgent, setUserAgent] = React.useState("");
   const [retry, setRetry] = React.useState<LLMRetryOverride>(ZERO_OVERRIDE); // 本配置的重试覆盖;全 0=跟随全局
   const [testing, setTesting] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
@@ -355,6 +366,7 @@ function ProfileSheet({
     setMaxTokens(String(profile?.max_tokens ?? 0));
     setMaxTokensField(fromStore(profile?.max_tokens_field));
     setSessionHeaderKey(profile?.session_header_key ?? "");
+    setUserAgent(profile?.user_agent ?? "");
     setRetry(profile?.retry ?? ZERO_OVERRIDE);
     setApiKey("");
     setKeyHint(profile?.api_key_hint ?? "");
@@ -369,7 +381,7 @@ function ProfileSheet({
     setLoadingModels(true);
     setModels([]);
     try {
-      const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId);
+      const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId, userAgent);
       if (r.ok && r.models && r.models.length > 0) {
         setModels(r.models);
         setModelsOpen(true);
@@ -401,6 +413,8 @@ function ProfileSheet({
         profileId,
         streaming,
         sessionHeaderKey.trim(),
+        userAgent,
+        format === "openai" ? toStore(maxTokensField) : "",
       );
       // 回复内容一并展示：看得见模型确实说了话，才算和会话里跑通是一回事。
       if (r.ok)
@@ -444,6 +458,7 @@ function ProfileSheet({
         // 后端也会再做一次同样的归一化，这里只是别让 UI 送出自相矛盾的值。
         max_tokens_field: format === "openai" ? toStore(maxTokensField) : "",
         session_header_key: sessionHeaderKey.trim(),
+        user_agent: userAgent,
         retry,
       });
       if (isNew) toast.success(`已新建：${name.trim()}（在卡片上「设为激活」以启用）`);
@@ -575,6 +590,49 @@ function ProfileSheet({
             <p className="text-muted-foreground text-xs">
               仅 LLM 出站请求走此代理，支持 http/https/socks5，可带账号密码（如
               socks5://user:pass@host:port，密码含特殊字符需 URL 编码）；留空表示不使用代理（直连）。
+            </p>
+          </div>
+
+          <div className="grid gap-2">
+            <Label htmlFor="p-user-agent-preset">User-Agent 预设</Label>
+            <Select
+              value={
+                !userAgent ? NONE : USER_AGENT_PRESETS.find((preset) => preset.value === userAgent)?.id ?? "custom"
+              }
+              onValueChange={(value) => {
+                if (value === NONE) setUserAgent("");
+                else {
+                  const preset = USER_AGENT_PRESETS.find((item) => item.id === value);
+                  if (preset) setUserAgent(preset.value);
+                }
+              }}
+            >
+              <SelectTrigger id="p-user-agent-preset" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={NONE}>默认（不覆盖）</SelectItem>
+                {USER_AGENT_PRESETS.map((preset) => (
+                  <SelectItem key={preset.id} value={preset.id}>{preset.label}</SelectItem>
+                ))}
+                <SelectItem value="custom" disabled>自定义（在下方填写）</SelectItem>
+              </SelectContent>
+            </Select>
+            <Label htmlFor="p-user-agent">自定义 User-Agent（可选）</Label>
+            <Input
+              id="p-user-agent"
+              className="font-mono"
+              placeholder="留空使用默认 User-Agent"
+              value={userAgent}
+              onChange={(e) => setUserAgent(e.target.value)}
+              maxLength={512}
+              autoComplete="off"
+              spellCheck={false}
+              aria-describedby="p-user-agent-help"
+            />
+            <p id="p-user-agent-help" className="text-muted-foreground text-xs">
+              用于本配置的模型请求、连接测试和模型列表。预设为可编辑示例，版本号可自行修改；
+              留空或选择“默认”恢复默认 UA。最多 512 个可打印 ASCII 字符。
             </p>
           </div>
 

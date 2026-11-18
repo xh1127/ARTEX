@@ -135,22 +135,12 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		EnableWebFetch:  true, // 走记录代理留痕；载入代理 CA 验证 MITM 重签的 HTTPS 证书
 		WebFetchProxy:   c.proxyAddr,
 		WebFetchCACert:  c.proxyCACert,
-		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
-		// WebSearchProxy 是独立出口代理(http/https/socks5)，与记录流量的 MITM 代理无关；空则直连。
-		EnableWebSearch:       ws.Enabled,
-		WebSearchBackend:      ws.Backend,
-		BraveSearchAPIKey:     ws.BraveKey,
-		TavilySearchAPIKey:    ws.TavilyKey,
-		DeepSeekSearchBaseURL: ws.DeepSeekBaseURL,
-		DeepSeekSearchAPIKey:  ws.DeepSeekAPIKey,
-		DeepSeekSearchModel:   ws.DeepSeekModel,
-		WebSearchProxy:        ws.Proxy,
-		BashEnv:               proxyEnv(c.proxyAddr, c.proxyCACert), // Bash 子命令默认走代理+信任 CA
-		WorkingDir:            sessionWorkDir,
-		MaxTurns:              maxTurns,
-		MaxDuration:           maxDuration,
-		Compaction:            compactionConfig(c.window),
-		Todos:                 actool.NewTodoStore(),
+		BashEnv:         proxyEnv(c.proxyAddr, c.proxyCACert), // Bash 子命令默认走代理+信任 CA
+		WorkingDir:      sessionWorkDir,
+		MaxTurns:        maxTurns,
+		MaxDuration:     maxDuration,
+		Compaction:      compactionConfig(c.window),
+		Todos:           actool.NewTodoStore(),
 		// large tool output spills to cmd-output/ under the session dir.
 		// 截断上限用 SDK 默认(tool.Capture 的 30000 字符)。
 		ToolOutputDir: filepath.Join(sessionWorkDir, "cmd-output"),
@@ -160,6 +150,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		NonStreaming: c.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:    c.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
 	}
+	configureWebSearch(&opts, ws)
 	if c.guard != nil {
 		opts.Hooks = c.guard.Hooks()
 	}

@@ -27,7 +27,6 @@ import (
 	"github.com/Autumn-27/artex/report"
 	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/norma/llm"
-	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
 )
 
@@ -49,10 +48,12 @@ type Server struct {
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
 	// free slots off the same snapshot and over-promote past the limit.
-	concMu sync.Mutex
+	concMu     sync.Mutex
+	settingsMu sync.Mutex // serialize settings commit and runtime publication
 
-	cfgMu     sync.Mutex
-	chatAgent *agent.ChatAgent // conversational runner for the chat page; nil w/o LLM
+	llmApplyMu sync.Mutex // serialize resolving and installing the global provider
+	cfgMu      sync.Mutex
+	chatAgent  *agent.ChatAgent // conversational runner for the chat page; nil w/o LLM
 	// llmProv is the fully-decorated global provider (recorder + failover chain)
 	// installed by applyLLM. Task routers use it after an explicit chain is cleared.
 	llmProv   llm.Provider
@@ -92,6 +93,7 @@ type Server struct {
 	// so edits take effect.
 	profMu         sync.Mutex
 	profChatAgents map[int64]*agent.ChatAgent // per-profile ChatAgent cache (chat page)
+	profCacheGen   uint64
 
 	// provByProfile caches ONE provider per LLM profile id so every agent bound or
 	// pinned to the same profile shares a single provider instance — hence one rate
@@ -325,22 +327,8 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	if err != nil || p == nil {
 		return agent.Config{}, false
 	}
-	cfg := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, p.APIKey, p.Proxy)
-	cfg.RatePerSecond, cfg.RatePerMinute = p.RatePerSecond, p.RatePerMinute
-	cfg.ContextWindowK = p.ContextWindowK
-	cfg.ThinkingType = p.ThinkingType
-	cfg.ReasoningEffort = p.ReasoningEffort
-	cfg.Stream = p.Streaming
-	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
-	cfg.SessionHeaderKey = p.SessionHeaderKey
-	s.applyProfileRetry(&cfg, p)
-	if cfg.APIKey == "" {
-		return cfg, false
-	}
-	s.cfgMu.Lock()
-	s.llmProf = p.Name
-	s.cfgMu.Unlock()
-	return cfg, true
+	cfg := s.configFromProfile(p)
+	return cfg, cfg.APIKey != ""
 }
 
 // saveLLMConfig persists the LLM config as the active "default" profile in PG.
@@ -358,6 +346,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	var maxTokens int
 	var maxTokensField string
 	var sessionHeaderKey string
+	var userAgent string
 	var retry db.RetryOverride
 	if profs, _ := s.m.pg.ListProfiles(); profs != nil {
 		for _, p := range profs {
@@ -365,6 +354,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 				id, priority, poolExclude, streaming = p.ID, p.Priority, p.PoolExclude, p.Streaming
 				maxTokens, maxTokensField = p.MaxTokens, p.MaxTokensField
 				sessionHeaderKey = p.SessionHeaderKey
+				userAgent = p.UserAgent
 				retry = p.Retry
 				break
 			}
@@ -376,7 +366,8 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 		ContextWindowK: cfg.ContextWindowK, ThinkingType: cfg.ThinkingType, ReasoningEffort: cfg.ReasoningEffort, IsDefault: true,
 		Priority: priority, PoolExclude: poolExclude, Streaming: streaming,
 		MaxTokens: maxTokens, MaxTokensField: maxTokensField, SessionHeaderKey: sessionHeaderKey,
-		Retry: retry,
+		UserAgent: userAgent,
+		Retry:     retry,
 	})
 	if err != nil {
 		return err
@@ -385,18 +376,17 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 }
 
 // reapplyActiveProfile hot-reloads the engine from the active DB profile so that
-// saving or activating a profile takes effect without a restart. Best-effort:
-// logs on failure and leaves the running engine untouched.
-func (s *Server) reapplyActiveProfile() {
-	cfg, ok := s.loadLLMConfig()
-	if !ok {
-		return
-	}
+// saving or activating a profile takes effect without a restart. Resolution
+// happens inside applyLLM's serialization, never from an earlier DB snapshot.
+func (s *Server) reapplyActiveProfile() error {
+	s.cfgMu.Lock()
+	cfg := s.llmCfg // environment fallback when there is no persisted selection
+	s.cfgMu.Unlock()
 	if err := s.applyLLM(cfg); err != nil {
 		log.Printf("[engine] reapply active profile failed: %v", err)
-		return
+		return err
 	}
-	log.Printf("[engine] LLM reapplied from active profile: %s / %s", cfg.Provider(), cfg.Model)
+	return nil
 }
 
 // webSearchFor gates the global web-search opts (backend/key) by an agent's own
@@ -423,70 +413,91 @@ func maxTokensResolver(cfg agent.Config) func() int {
 	return func() int { return maxTokens }
 }
 
-// applyLLM (re)builds the planner/worker/main-agent from cfg and installs them on
-// the running engine as the GLOBAL active pair. Safe to call at runtime (UI configures LLM).
+// applyLLM installs the latest persisted selection, falling back to cfg only
+// when no profile is active (environment configuration). Callers may hold an old
+// cfg: it must never override a profile saved by a more recent request.
 func (s *Server) applyLLM(cfg agent.Config) error {
-	var prov llm.Provider
-	// A persisted active profile must use the same cached provider as task chains
-	// and Agent bindings, otherwise each path owns a separate rate limiter.
-	if active, _ := s.m.pg.ActiveProfile(); active != nil {
-		if activeCfg, ok := s.loadProfileConfig(active.ID); ok && activeCfg == cfg {
-			prov, _, _ = s.providerForProfile(active.ID)
+	s.llmApplyMu.Lock()
+	defer s.llmApplyMu.Unlock()
+	for {
+		s.profMu.Lock()
+		generation := s.profCacheGen
+		s.profMu.Unlock()
+		direct, current, profileID, name, err := s.resolveGlobalProvider(cfg)
+		prov := direct
+		var chat *agent.ChatAgent
+		if err == nil && prov != nil {
+			if profileID != 0 {
+				prov = s.poolForActive(profileID, prov, current)
+			}
+			tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
+			chat = agent.NewChatAgent(prov, current.Model, s.m.dir, tx, current.CompactionWindow())
+			chat.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+			chat.SetWebSearch(s.m.WebSearchOpts())
+			chat.SetGuard(s.chatGuard())
+			chat.SetNonStreaming(nonStreamingResolver(current))
+			chat.SetMaxTokens(maxTokensResolver(current))
+			chat.SetNoaEnabled(s.m.NoaCompactionEnabled)
 		}
-	}
-	if prov == nil {
-		var err error
-		prov, err = cfg.NewProvider()
-		if err != nil {
+		s.profMu.Lock()
+		if generation != s.profCacheGen {
+			s.profMu.Unlock()
+			continue // A profile/settings change invalidated this build.
+		}
+		if errors.Is(err, errLLMConfigRead) {
+			// A failed read tells us nothing about the saved configuration. Keep
+			// the working runtime; only a confirmed invalid config disables it.
+			s.profMu.Unlock()
 			return err
 		}
-		// Non-persisted/env configs do not have a profile cache key.
+		// Publish all runtime fields together; readers must never see a new
+		// direct provider paired with an old config, name, or chat agent.
 		s.cfgMu.Lock()
-		profName := s.llmProf
+		s.llmDirect, s.llmProv, s.chatAgent = direct, prov, chat
+		s.llmCfg, s.llmProf = current, name
+		s.llmOn = err == nil && prov != nil
 		s.cfgMu.Unlock()
-		prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, profName, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
-		prov = bindSideProvider(prov, cfg, 0, profName)
+		s.profMu.Unlock()
+		s.invalidateTaskAgents()
+		if err == nil && prov != nil {
+			if t := s.m.ActiveTask(); t != nil {
+				t.Notify()
+			}
+		}
+		return err
 	}
-	s.cfgMu.Lock()
-	s.llmDirect = prov
-	s.cfgMu.Unlock()
-	// LLM 轮询(默认关):把激活配置包进故障转移链,当前配置不可用时自动切下一个。
-	// 只影响「走全局激活配置」的这条路径——agent 绑定 / 任务 pin 的走 providerForProfile,
-	// 默认仍然独占该配置(见 poolForBinding)。关闭或无备选时返回原 provider,行为不变。
-	if act, err := s.m.pg.ActiveProfile(); err == nil && act != nil {
-		prov = s.poolForActive(act.ID, prov, cfg)
-	}
-	// No global planner/worker pair: every task runs on its own task-routed pair
-	// (agentsForTask), resolved through the engine's authoritative resolver. Global
-	// readiness (Ready()/llm_configured) is reported from s.llmOn, set below.
+}
 
-	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
-	win := cfg.CompactionWindow()
-	// chat stays the GLOBAL fallback since one ChatAgent serves many agent keys — its
-	// per-agent binding is resolved at Chat time (runConversationSync →
-	// chatAgentForProfile). The main-agent has no global instance: each task builds its
-	// own via agentsForTask (task-routed), so nothing is constructed for it here.
-	s.cfgMu.Lock()
-	// chat agent serves MANY custom agents by key → it holds the GLOBAL opts
-	// (backend/key) and gates Enabled per-conversation-agent at Chat time. 对话始终用激活配置。
-	s.chatAgent = agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, win) // chat page runner
-	s.chatAgent.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
-	s.chatAgent.SetWebSearch(s.m.WebSearchOpts())
-	s.chatAgent.SetGuard(s.chatGuard())
-	s.chatAgent.SetNonStreaming(nonStreamingResolver(cfg))
-	s.chatAgent.SetMaxTokens(maxTokensResolver(cfg))
-	s.chatAgent.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
-	s.llmProv = prov
-	s.llmCfg = cfg
-	s.llmOn = true
-	s.cfgMu.Unlock()
-	s.invalidateTaskAgents()
+var errLLMConfigRead = errors.New("读取 LLM 配置失败")
 
-	// wake the active task so a task created while idle starts exploring.
-	if t := s.m.ActiveTask(); t != nil {
-		t.Notify()
+func (s *Server) resolveGlobalProvider(fallback agent.Config) (llm.Provider, agent.Config, int64, string, error) {
+	if s.m.pg != nil {
+		p, err := s.m.pg.ActiveProfile()
+		if err != nil {
+			return nil, agent.Config{}, 0, "", fmt.Errorf("%w: %w", errLLMConfigRead, err)
+		}
+		if p != nil {
+			cfg := s.configFromProfile(p)
+			if cfg.APIKey == "" {
+				return nil, cfg, p.ID, p.Name, fmt.Errorf("激活配置 %q 未提供 API Key", p.Name)
+			}
+			// Reuse the provider/limiter shared by bindings and task chains.
+			prov, resolved, err := s.providerForProfileErr(p.ID)
+			if err != nil {
+				return nil, cfg, p.ID, p.Name, fmt.Errorf("激活配置 %q 无法构建模型客户端: %w", p.Name, err)
+			}
+			return prov, resolved, p.ID, p.Name, nil
+		}
 	}
-	return nil
+	if fallback.APIKey == "" {
+		return nil, fallback, 0, "", nil
+	}
+	prov, err := fallback.NewProvider()
+	if err != nil {
+		return nil, fallback, 0, "", err
+	}
+	prov = llmrec.Wrap(prov, s.m.PG(), fallback.Model, "", fallback.ThinkingType, fallback.ReasoningEffort, s.m.LLMRecordEnabled)
+	return bindSideProvider(prov, fallback, 0, ""), fallback, 0, "", nil
 }
 
 // loadProfileConfig builds an agent.Config from a specific profile id (with its key).
@@ -496,6 +507,11 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	if err != nil || p == nil {
 		return agent.Config{}, false
 	}
+	cfg := s.configFromProfile(p)
+	return cfg, cfg.APIKey != ""
+}
+
+func (s *Server) configFromProfile(p *db.LLMProfile) agent.Config {
 	cfg := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, p.APIKey, p.Proxy)
 	cfg.RatePerSecond, cfg.RatePerMinute = p.RatePerSecond, p.RatePerMinute
 	cfg.ContextWindowK = p.ContextWindowK
@@ -504,11 +520,9 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.Stream = p.Streaming
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
+	cfg.UserAgent = p.UserAgent
 	s.applyProfileRetry(&cfg, p)
-	if cfg.APIKey == "" {
-		return cfg, false
-	}
-	return cfg, true
+	return cfg
 }
 
 // effectiveProfileForAgent resolves the LLM profile id an agent should run on, by
@@ -560,31 +574,43 @@ func (s *Server) chatUnavailableReason() string {
 // bound/pinned to the same profile shares one provider instance (one rate limiter).
 // ok=false when the profile is missing/invalid → caller falls back to the global pair.
 func (s *Server) providerForProfile(id int64) (llm.Provider, agent.Config, bool) {
+	prov, cfg, err := s.providerForProfileErr(id)
+	return prov, cfg, err == nil
+}
+
+// Preserve read errors for hot reload, which must distinguish an unavailable
+// database from a configuration that is known to be unusable.
+func (s *Server) providerForProfileErr(id int64) (llm.Provider, agent.Config, error) {
 	s.provCacheMu.Lock()
 	if e := s.provByProfile[id]; e != nil {
 		s.provCacheMu.Unlock()
-		return e.prov, e.cfg, true
+		return e.prov, e.cfg, nil
 	}
 	generation := s.provCacheGen
 	s.provCacheMu.Unlock()
-	cfg, ok := s.loadProfileConfig(id)
-	if !ok {
-		return nil, agent.Config{}, false
+	p, err := s.m.pg.ProfileByID(id)
+	if err != nil {
+		return nil, agent.Config{}, fmt.Errorf("%w: %w", errLLMConfigRead, err)
+	}
+	if p == nil {
+		return nil, agent.Config{}, db.ErrLLMProfileNotFound
+	}
+	cfg := s.configFromProfile(p)
+	if cfg.APIKey == "" {
+		return nil, cfg, fmt.Errorf("配置 %q 未提供 API Key", p.Name)
 	}
 	prov, err := cfg.NewProvider()
 	if err != nil {
 		log.Printf("[engine] build provider for LLM profile %d failed: %v", id, err)
-		return nil, agent.Config{}, false
+		return nil, cfg, err
 	}
-	// Wrap with recorder, tagged with this profile's name.
-	if p, _ := s.m.pg.ProfileByID(id); p != nil {
-		prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, p.Name, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
-		prov = bindSideProvider(prov, cfg, id, p.Name)
-	}
+	// Use the same snapshot for credentials, recording, and side-model identity.
+	prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, p.Name, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
+	prov = bindSideProvider(prov, cfg, id, p.Name)
 	s.provCacheMu.Lock()
 	if generation != s.provCacheGen {
 		s.provCacheMu.Unlock()
-		return s.providerForProfile(id)
+		return s.providerForProfileErr(id)
 	}
 	if e := s.provByProfile[id]; e != nil { // lost the race → keep the winner
 		prov, cfg = e.prov, e.cfg
@@ -593,38 +619,45 @@ func (s *Server) providerForProfile(id int64) (llm.Provider, agent.Config, bool)
 		log.Printf("[engine] built provider for LLM profile %d (%s / %s)", id, cfg.Provider(), cfg.Model)
 	}
 	s.provCacheMu.Unlock()
-	return prov, cfg, true
+	return prov, cfg, nil
 }
 
 // chatAgentForProfile returns a ChatAgent built from a specific LLM profile, cached
 // per profile id. Returns nil if the profile is missing or has no API key.
 func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
-	s.profMu.Lock()
-	cached := s.profChatAgents[id]
-	s.profMu.Unlock()
-	if cached != nil {
-		return cached
+	for {
+		s.profMu.Lock()
+		cached := s.profChatAgents[id]
+		generation := s.profCacheGen
+		s.profMu.Unlock()
+		if cached != nil {
+			return cached
+		}
+		prov, cfg, ok := s.providerForProfile(id)
+		if !ok {
+			return nil
+		}
+		tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
+		ca := agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
+		ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+		ca.SetWebSearch(s.m.WebSearchOpts())
+		ca.SetGuard(s.chatGuard())
+		ca.SetNonStreaming(nonStreamingResolver(cfg))
+		ca.SetMaxTokens(maxTokensResolver(cfg))
+		ca.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
+		s.profMu.Lock()
+		if generation != s.profCacheGen {
+			s.profMu.Unlock()
+			continue // A profile changed while this agent was being built.
+		}
+		if ex := s.profChatAgents[id]; ex != nil { // lost the race → keep the winner
+			ca = ex
+		} else {
+			s.profChatAgents[id] = ca
+		}
+		s.profMu.Unlock()
+		return ca
 	}
-	prov, cfg, ok := s.providerForProfile(id)
-	if !ok {
-		return nil
-	}
-	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
-	ca := agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
-	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
-	ca.SetWebSearch(s.m.WebSearchOpts())
-	ca.SetGuard(s.chatGuard())
-	ca.SetNonStreaming(nonStreamingResolver(cfg))
-	ca.SetMaxTokens(maxTokensResolver(cfg))
-	ca.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
-	s.profMu.Lock()
-	if ex := s.profChatAgents[id]; ex != nil { // lost the race → keep the winner
-		ca = ex
-	} else {
-		s.profChatAgents[id] = ca
-	}
-	s.profMu.Unlock()
-	return ca
 }
 
 // invalidateProfileAgents drops the per-profile ChatAgent + provider caches so a profile
@@ -632,12 +665,15 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 // (and re-resolves each agent's bound model) on their next round.
 func (s *Server) invalidateProfileAgents() {
 	s.profMu.Lock()
-	s.profChatAgents = map[int64]*agent.ChatAgent{}
-	s.profMu.Unlock()
+	// Keep both caches in the same generation: no new chat builder may take
+	// an old provider between clearing the chat and provider caches.
 	s.provCacheMu.Lock()
+	s.profCacheGen++
+	s.profChatAgents = map[int64]*agent.ChatAgent{}
 	s.provCacheGen++
 	s.provByProfile = map[int64]*provEntry{}
 	s.provCacheMu.Unlock()
+	s.profMu.Unlock()
 	s.invalidateTaskAgents()
 }
 
@@ -1294,6 +1330,7 @@ func (s *Server) getLLM(w http.ResponseWriter, r *http.Request) {
 		"model":            s.llmCfg.Model,
 		"base_url":         s.llmCfg.BaseURL,
 		"proxy":            s.llmCfg.Proxy,
+		"user_agent":       s.llmCfg.UserAgent,
 		"key_set":          s.llmCfg.APIKey != "",
 		"rate_per_second":  s.llmCfg.RatePerSecond,
 		"rate_per_minute":  s.llmCfg.RatePerMinute,
@@ -1350,7 +1387,8 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.invalidateProfileAgents()
-	if _, ok := s.loadLLMConfig(); !ok {
+	cfg, ok := s.loadLLMConfig()
+	if !ok {
 		writeErr(w, 500, "saved provider is unavailable")
 		return
 	}
@@ -1365,16 +1403,18 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 // testLLM makes a real minimal completion to verify the config works.
 func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider         string `json:"provider"`
-		Model            string `json:"model"`
-		BaseURL          string `json:"base_url"`
-		Proxy            string `json:"proxy"`
-		APIKey           string `json:"api_key"`
-		ThinkingType     string `json:"thinking_type"`
-		ReasoningEffort  string `json:"reasoning_effort"`
-		ProfileID        *int64 `json:"profile_id"`         // 测已存 profile 时传入：api_key 为空则用它存的 key
-		Streaming        *bool  `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
-		SessionHeaderKey string `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
+		Provider         string  `json:"provider"`
+		Model            string  `json:"model"`
+		BaseURL          string  `json:"base_url"`
+		Proxy            string  `json:"proxy"`
+		APIKey           string  `json:"api_key"`
+		ThinkingType     string  `json:"thinking_type"`
+		ReasoningEffort  string  `json:"reasoning_effort"`
+		ProfileID        *int64  `json:"profile_id"`         // 测已存 profile 时传入：api_key 为空则用它存的 key
+		Streaming        *bool   `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
+		SessionHeaderKey *string `json:"session_header_key"` // 省略=使用已存配置；空字符串=不发送会话头
+		UserAgent        *string `json:"user_agent"`         // 省略=使用已存配置；空字符串=恢复默认
+		MaxTokensField   *string `json:"max_tokens_field"`   // 省略=使用已存配置；空字符串=max_tokens
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1393,19 +1433,42 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// 自定义会话头名照该配置来：非空则测试请求也发这个头(值为一次性随机 session id，
 	// 见 TestConnection)。opencode zen 等强制要求 x-opencode-session 的端点，缺了它
 	// 直接 400，必须在测试路径上也带上，否则"对话通、测试 400"。
-	cfg.SessionHeaderKey = req.SessionHeaderKey
+	if req.SessionHeaderKey != nil {
+		cfg.SessionHeaderKey = *req.SessionHeaderKey
+	}
+	if req.MaxTokensField != nil {
+		cfg.MaxTokensField = *req.MaxTokensField
+	}
+	if req.UserAgent != nil {
+		var err error
+		cfg.UserAgent, err = agent.NormalizeUserAgent(*req.UserAgent)
+		if err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+	}
 	// API Key 解析优先级：表单输入 > 指定 profile 存的 key > 全局配置的 key。
 	// 已存 profile 的 key 不回传浏览器，所以测试已存配置时表单为空，需从 DB 取。
 	// 会话头名同理：表单未带时用已存 profile 的值兜底。
-	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
+	if req.ProfileID != nil && (cfg.APIKey == "" || req.SessionHeaderKey == nil || req.UserAgent == nil || req.MaxTokensField == nil) {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
 			if cfg.APIKey == "" {
 				cfg.APIKey = p.APIKey
 			}
-			if cfg.SessionHeaderKey == "" {
+			if req.SessionHeaderKey == nil {
 				cfg.SessionHeaderKey = p.SessionHeaderKey
 			}
+			if req.UserAgent == nil {
+				cfg.UserAgent = p.UserAgent
+			}
+			if req.MaxTokensField == nil {
+				cfg.MaxTokensField = p.MaxTokensField
+			}
 		}
+	}
+	// Match profile-save normalization; the other formats choose their own field.
+	if cfg.Provider() != "openai" || cfg.MaxTokensField != llm.MaxTokensFieldCompletion {
+		cfg.MaxTokensField = ""
 	}
 	if cfg.APIKey == "" {
 		s.cfgMu.Lock()
@@ -3395,44 +3458,14 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if req.ConstraintsInjectPlanner != nil {
-		if err := s.m.pg.SetBool(settingConstraintsInjectPlanner, *req.ConstraintsInjectPlanner); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-	}
-	if req.ConstraintsInjectWorker != nil {
-		if err := s.m.pg.SetBool(settingConstraintsInjectWorker, *req.ConstraintsInjectWorker); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-	}
-	if req.NoaCompaction != nil {
-		// 每 run 读的解析器,切换即时对之后启动的 run 生效,无需 applyLLM 重建。
-		if err := s.m.SetNoaCompaction(*req.NoaCompaction); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-	}
-	// 推送全局项:投递引擎每轮重新读取,所以即时生效、无需重启。
-	if req.NotifyEnabled != nil {
-		if err := s.m.pg.SetBool(settingNotifyEnabled, *req.NotifyEnabled); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-	}
+	// Validate the whole patch before either persistence or runtime side effects.
 	if req.NotifyBaseURL != nil {
-		// 统一裁掉尾部斜杠:回链拼接用的是 fmt.Sprintf("%s/function/..."),
-		// 留着尾部斜杠会产出 "//function/..." 这种双斜杠路径。
 		base := trimTrailingSlash(strings.TrimSpace(*req.NotifyBaseURL))
 		if base != "" && !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
 			writeErr(w, 400, "回链地址需以 http:// 或 https:// 开头")
 			return
 		}
-		if err := s.m.pg.SetSetting(settingNotifyPublicBaseURL, base); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
+		*req.NotifyBaseURL = base
 	}
 	if req.NotifyDigestMins != nil {
 		// 下限 1 分钟:更短的周期等于实时推送,那样应该直接把渠道改成 realtime 模式。
@@ -3440,16 +3473,69 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, "汇总周期需在 1 到 1440 分钟之间")
 			return
 		}
-		if err := s.m.pg.SetSetting(settingNotifyDigestMinutes, strconv.Itoa(*req.NotifyDigestMins)); err != nil {
-			writeErr(w, 500, err.Error())
-			return
+	}
+	if req.Workers != nil && *req.Workers <= 0 {
+		writeErr(w, 400, "workers 必须 >0")
+		return
+	}
+	for _, proxy := range []*string{req.GlobalProxy, req.WebSearchProxy} {
+		if proxy != nil {
+			*proxy = strings.TrimSpace(*proxy)
+			if *proxy != "" {
+				if _, err := traffic.ValidateProxyURL(*proxy); err != nil {
+					writeErr(w, 400, err.Error())
+					return
+				}
+			}
+		}
+	}
+	if req.WebSearchBackend != nil {
+		*req.WebSearchBackend = strings.TrimSpace(*req.WebSearchBackend)
+		if *req.WebSearchBackend == "" {
+			*req.WebSearchBackend = defaultWebSearchBackend
+		}
+	}
+	if req.PythonInterp != nil {
+		*req.PythonInterp = strings.TrimSpace(*req.PythonInterp)
+	}
+
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+	values := map[string]string{}
+	for key, value := range map[string]*bool{
+		settingConstraintsInjectPlanner: req.ConstraintsInjectPlanner,
+		settingConstraintsInjectWorker:  req.ConstraintsInjectWorker,
+		settingNoaCompaction:            req.NoaCompaction,
+		settingNotifyEnabled:            req.NotifyEnabled,
+		settingLLMRecord:                req.LLMRecord,
+		settingLLMPoolOn:                req.LLMPoolEnabled,
+		settingLLMPoolBindFallback:      req.LLMPoolBindFallback,
+		settingAgentTrafficBinding:      req.AgentTrafficBinding,
+		settingTrafficCapture:           req.TrafficCapture,
+		settingWebSearchOn:              req.WebSearchEnabled,
+	} {
+		if value != nil {
+			values[key] = strconv.FormatBool(*value)
+		}
+	}
+	for key, value := range map[string]*string{
+		settingNotifyPublicBaseURL: req.NotifyBaseURL,
+		settingPythonInterp:        req.PythonInterp,
+		settingGlobalProxy:         req.GlobalProxy,
+		settingWebSearchBackend:    req.WebSearchBackend,
+		settingBraveKey:            req.BraveKey,
+		settingTavilyKey:           req.TavilyKey,
+		settingWebSearchProxy:      req.WebSearchProxy,
+	} {
+		if value != nil {
+			values[key] = *value
 		}
 	}
 	if req.Workers != nil {
-		if err := s.m.SetWorkers(*req.Workers); err != nil {
-			writeErr(w, 400, err.Error())
-			return
-		}
+		values[settingWorkers] = strconv.Itoa(*req.Workers)
+	}
+	if req.NotifyDigestMins != nil {
+		values[settingNotifyDigestMinutes] = strconv.Itoa(*req.NotifyDigestMins)
 	}
 	if req.ConcurrencyEnabled != nil || req.ConcurrencyLimit != nil {
 		// 部分 PUT:未给的字段用当前值兜底,避免只改一个把另一个重置。
@@ -3464,84 +3550,61 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		if req.ConcurrencyLimit != nil {
 			limit = *req.ConcurrencyLimit
 		}
-		if err := s.m.SetConcurrency(on, limit); err != nil {
-			writeErr(w, 400, err.Error())
-			return
+		if limit < 1 {
+			limit = defaultConcurrencyLimit
 		}
-		// 立即协调一次:关闭时放行全部排队,调高上限时补位启动,不必等下一个 tick。
-		go s.reconcileConcurrency()
+		values[settingConcurrencyOn] = strconv.FormatBool(on)
+		values[settingConcurrencyLimit] = strconv.Itoa(limit)
 	}
-	if req.PythonInterp != nil {
-		if err := s.m.pg.SetSetting(settingPythonInterp, strings.TrimSpace(*req.PythonInterp)); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
+	if err := s.m.pg.SetSettings(r.Context(), values); err != nil {
+		writeErr(w, 500, err.Error())
+		return
 	}
+	// Publish in-memory settings only after the entire transaction committed.
+	s.m.mu.Lock()
 	if req.LLMRecord != nil {
-		// 录制器每次调用读取该标志，切换即时生效，无需 applyLLM 重建。
-		if err := s.m.SetLLMRecordEnabled(*req.LLMRecord); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-	}
-	changed := false
-	if req.LLMPoolEnabled != nil {
-		if err := s.m.SetLLMPoolEnabled(*req.LLMPoolEnabled); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-		changed = true // the provider chain itself changes shape → rebuild
-	}
-	if req.LLMPoolBindFallback != nil {
-		if err := s.m.SetLLMPoolBindFallback(*req.LLMPoolBindFallback); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-		changed = true
-	}
-	if req.LLMPoolEnabled != nil || req.LLMPoolBindFallback != nil {
-		// Pinned tasks' planner/worker and per-profile chat agents hold providers
-		// built under the OLD switch state — drop them so they pick up the new one.
-		s.invalidateProfileAgents()
-	}
-	if req.AgentTrafficBinding != nil {
-		if err := s.m.pg.SetBool(settingAgentTrafficBinding, *req.AgentTrafficBinding); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
+		s.m.llmRecOn = *req.LLMRecord
 	}
 	if req.TrafficCapture != nil {
-		if err := s.m.SetTrafficEnabled(*req.TrafficCapture); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-		changed = true
+		s.m.trafficOn = *req.TrafficCapture
 	}
 	if req.GlobalProxy != nil {
-		// Validation failure (bad scheme/host) is a client error, not a 500.
-		if err := s.m.SetGlobalProxy(*req.GlobalProxy); err != nil {
-			writeErr(w, 400, err.Error())
-			return
-		}
-		changed = true // capture-off egress is baked into agents at build time → rebuild
+		s.m.globalProxy = *req.GlobalProxy
 	}
-	if req.WebSearchEnabled != nil || req.WebSearchBackend != nil || req.BraveKey != nil || req.TavilyKey != nil || req.WebSearchProxy != nil {
-		// Fill unspecified fields from current state so a partial PUT doesn't reset them.
-		on, backend, _, _, _ := s.m.WebSearch()
-		if req.WebSearchEnabled != nil {
-			on = *req.WebSearchEnabled
-		}
-		if req.WebSearchBackend != nil {
-			backend = *req.WebSearchBackend
-		}
-		if err := s.m.SetWebSearch(on, backend, req.BraveKey, req.TavilyKey, req.WebSearchProxy); err != nil {
+	if req.WebSearchEnabled != nil {
+		s.m.webSearchOn = *req.WebSearchEnabled
+	}
+	if req.WebSearchBackend != nil {
+		s.m.webSearchBackend = *req.WebSearchBackend
+	}
+	if req.BraveKey != nil {
+		s.m.braveKey = *req.BraveKey
+	}
+	if req.TavilyKey != nil {
+		s.m.tavilyKey = *req.TavilyKey
+	}
+	if req.WebSearchProxy != nil {
+		s.m.webSearchProxy = *req.WebSearchProxy
+	}
+	s.m.mu.Unlock()
+	if req.GlobalProxy != nil && s.m.traffic != nil {
+		if err := s.m.traffic.SetUpstreamProxy(*req.GlobalProxy); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
-		changed = true
 	}
+	if req.GlobalProxy != nil || req.TrafficCapture != nil {
+		s.m.syncBrowserMCPProxy()
+	}
+	if req.ConcurrencyEnabled != nil || req.ConcurrencyLimit != nil {
+		go s.reconcileConcurrency()
+	}
+	changed := req.LLMPoolEnabled != nil || req.LLMPoolBindFallback != nil || req.TrafficCapture != nil || req.GlobalProxy != nil ||
+		req.WebSearchEnabled != nil || req.WebSearchBackend != nil || req.BraveKey != nil || req.TavilyKey != nil || req.WebSearchProxy != nil
 	if changed {
-		// rebuild agents so the new proxy/tools/prompt/web-search take hold (only if LLM configured).
+		// Bound chats/tasks capture proxy and search settings too, even when no
+		// global LLM is configured. Drop their caches before rebuilding fallback.
+		s.invalidateProfileAgents()
 		s.cfgMu.Lock()
 		cfg, on := s.llmCfg, s.llmOn
 		s.cfgMu.Unlock()
@@ -3588,22 +3651,22 @@ func (s *Server) testWebSearch(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(req.TavilyKey) != "" {
 		tavilyKey = req.TavilyKey
 	}
-	cfg := actool.WebSearchConfig{Backend: backend, BraveAPIKey: braveKey, TavilyAPIKey: tavilyKey, Proxy: proxy}
+	cfg := agent.WebSearchOpts{Backend: backend, BraveKey: braveKey, TavilyKey: tavilyKey, Proxy: proxy}
 	// Hard cap so a slow/blocked proxy can't hang the request.
 	wall := 30 * time.Second
 	// deepseek 的凭据不在表单里，来自当前激活的 LLM 配置；同时它每次搜索都跑一次
 	// 模型推理，30s 的通用上限偏紧，单独放宽。这里不预判配置能不能用——测这一下
 	// 本来就是给用户自己确认的手段，真跑不通时下面的报错比预判更有信息量。
 	probeQuery := "test"
-	if strings.TrimSpace(backend) == deepSeekWebSearchBackend {
-		cfg.DeepSeekBaseURL, cfg.DeepSeekAPIKey, cfg.DeepSeekModel = s.m.deepSeekSearchCreds()
+	if strings.EqualFold(strings.TrimSpace(backend), deepSeekWebSearchBackend) {
+		cfg.DeepSeekBaseURL, cfg.DeepSeekAPIKey, cfg.DeepSeekModel, cfg.DeepSeekUserAgent = s.m.deepSeekSearchCreds()
 		wall = 120 * time.Second
 		// 搜索词由 DeepSeek 端的模型自行决定，"test" 太空泛会让它跳过搜索直接作答。
 		probeQuery = "DeepSeek company official website"
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), wall)
 	defer cancel()
-	results, err := actool.WebSearchProbe(ctx, cfg, probeQuery, 3)
+	results, err := agent.ProbeWebSearch(ctx, cfg, probeQuery, 3)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error(), "backend": backend})
 		return

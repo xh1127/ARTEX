@@ -41,7 +41,13 @@ type sideQuestionState struct {
 }
 
 func sideModel(cfg agent.Config, id int64, name string) sidequestion.Model {
-	b, _ := json.Marshal([]any{cfg.Format, cfg.BaseURL, cfg.Model, cfg.ThinkingType, cfg.ReasoningEffort, cfg.Stream, cfg.MaxTokensField, cfg.SessionHeaderKey})
+	identity := []any{cfg.Format, cfg.BaseURL, cfg.Model, cfg.ThinkingType, cfg.ReasoningEffort, cfg.Stream, cfg.MaxTokensField, cfg.SessionHeaderKey}
+	// Keep the pre-UA fingerprint for unchanged configurations so persisted
+	// snapshots survive upgrades. A custom UA must still invalidate stale ones.
+	if cfg.UserAgent != "" {
+		identity = append(identity, cfg.UserAgent)
+	}
+	b, _ := json.Marshal(identity)
 	h := sha256.Sum256(b)
 	return sidequestion.Model{ProfileID: id, Name: name, Format: string(cfg.Format), Model: cfg.Model, Identity: hex.EncodeToString(h[:]), Streaming: cfg.Stream, WindowTokens: cfg.CompactionWindow()}
 }

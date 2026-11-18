@@ -561,7 +561,7 @@ func (m *Manager) WebSearchOpts() agent.WebSearchOpts {
 	}
 	o := agent.WebSearchOpts{Enabled: on, Backend: backend, BraveKey: braveKey, TavilyKey: tavilyKey, Proxy: proxy}
 	if backend == deepSeekWebSearchBackend {
-		o.DeepSeekBaseURL, o.DeepSeekAPIKey, o.DeepSeekModel = m.deepSeekSearchCreds()
+		o.DeepSeekBaseURL, o.DeepSeekAPIKey, o.DeepSeekModel, o.DeepSeekUserAgent = m.deepSeekSearchCreds()
 	}
 	return o
 }
@@ -573,12 +573,12 @@ func (m *Manager) WebSearchOpts() agent.WebSearchOpts {
 // states the requirement and the user decides. A profile that can't serve it
 // simply fails at search time (or at the settings page's 测试 button), which is
 // the same feedback every other backend gives for a bad key.
-func (m *Manager) deepSeekSearchCreds() (baseURL, apiKey, model string) {
+func (m *Manager) deepSeekSearchCreds() (baseURL, apiKey, model, userAgent string) {
 	p, err := m.pg.ActiveProfile()
 	if err != nil || p == nil {
-		return "", "", ""
+		return "", "", "", ""
 	}
-	return p.BaseURL, p.APIKey, p.Model
+	return p.BaseURL, p.APIKey, p.Model, p.UserAgent
 }
 
 // SetWebSearch persists and applies the web-search settings. braveKey, tavilyKey, and

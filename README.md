@@ -218,6 +218,8 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 **LLM**：`export ANTHROPIC_API_KEY=sk-...`（或 `OPENAI_API_KEY`），也可在 UI 的「LLM 配置」页填写。
 可选：`ARTEX_LLM_PROVIDER` / `ARTEX_LLM_MODEL` / `ARTEX_LLM_BASE_URL` / `ARTEX_LLM_PROXY`。
 
+在「LLM 配置」中新建或编辑配置，可填写 **自定义 User-Agent**，也可选择 Claude Code、Codex CLI、OpenCode 预设后继续编辑。预设是固定版本示例，不会自动跟随客户端更新。留空或选择“默认”沿用 SDK / HTTP 客户端的默认 UA。设置按配置独立保存，对模型调用（含流式、非流式与重试）、连接测试和模型列表请求生效；连接测试和加载模型会使用表单当前值，无需先保存。
+
 **并发**：每个任务的 work agent 数在「系统设置」里配置（默认 3）。
 
 **常用参数**：`./start.sh -addr :8787 -proxy :8788`（`-addr` 前端+API，`-proxy` 流量录制代理）。启动脚本会把参数原样透传给 `artex`。

@@ -1799,8 +1799,9 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	// would get wrong — legacy/partial clients that never send it stay streaming.
 	var body struct {
 		db.LLMProfile
-		APIKey    string `json:"api_key"`
-		Streaming *bool  `json:"streaming"`
+		APIKey    string  `json:"api_key"`
+		Streaming *bool   `json:"streaming"`
+		UserAgent *string `json:"user_agent"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1809,6 +1810,31 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	p := body.LLMProfile
 	p.APIKey = body.APIKey
 	p.Streaming = body.Streaming == nil || *body.Streaming
+	var existing *db.LLMProfile
+	if p.ID != 0 {
+		var err error
+		existing, err = pg.ProfileByID(p.ID)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if existing == nil {
+			writeErr(w, 404, "LLM 配置不存在")
+			return
+		}
+	}
+	// Omitted by older clients: retain the saved UA. Explicit empty clears it.
+	if body.UserAgent != nil {
+		p.UserAgent = *body.UserAgent
+	} else if existing != nil {
+		p.UserAgent = existing.UserAgent
+	}
+	userAgent, err := agent.NormalizeUserAgent(p.UserAgent)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	p.UserAgent = userAgent
 	// 输出上限:负数无意义,归零(= 不发送该字段)。字段名开关只有 Chat Completions
 	// 用得上——anthropic 与 openai-responses 各自定死了字段名,存下来只会误导后续读者,
 	// 故非 openai 格式一律清空。未知取值同样清空,避免把 DB CHECK 的报错甩给用户。
@@ -1817,6 +1843,21 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	if p.Format != "openai" || p.MaxTokensField != llm.MaxTokensFieldCompletion {
 		p.MaxTokensField = ""
+	}
+	// Validate the effective saved configuration before changing the database.
+	// An empty key on update keeps the stored key; inactive drafts may omit it.
+	candidate := p
+	if candidate.APIKey == "" && existing != nil {
+		candidate.APIKey = existing.APIKey
+	}
+	cfg := s.configFromProfile(&candidate)
+	if existing != nil && existing.IsDefault && cfg.APIKey == "" {
+		writeErr(w, 400, "激活配置必须提供 API Key")
+		return
+	}
+	if _, err := cfg.NewProvider(); err != nil {
+		writeErr(w, 400, "配置无效，无法保存: "+err.Error())
+		return
 	}
 	id, err := pg.SaveProfile(&p)
 	if err != nil {
@@ -1830,7 +1871,10 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	// Hot-apply. Not just when the ACTIVE profile changed: with failover on, any
 	// profile's key/model/priority/pool_exclude edit reshapes the chain, so the
 	// engine's provider has to be rebuilt either way.
-	s.reapplyActiveProfile()
+	if err := s.reapplyActiveProfile(); err != nil {
+		writeErr(w, 500, "配置已保存，但模型客户端更新失败: "+err.Error())
+		return
+	}
 	writeJSON(w, 200, map[string]any{"id": id})
 }
 
@@ -1863,7 +1907,10 @@ func (s *Server) pgSaveLLMRetryPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	s.applyRetryPolicy()
 	s.invalidateProfileAgents()
-	s.reapplyActiveProfile()
+	if err := s.reapplyActiveProfile(); err != nil {
+		writeErr(w, 500, "重试策略已保存，但模型客户端更新失败: "+err.Error())
+		return
+	}
 	writeJSON(w, 200, pg.LLMRetryPolicy())
 }
 
@@ -1893,7 +1940,10 @@ func (s *Server) pgDeleteProfile(w http.ResponseWriter, r *http.Request) {
 	s.restoreTasksAfterProfileDelete(pg)
 	// Cache invalidation also removed the active profile's shared provider entry.
 	// Reapply after task-state sync so the wake-up observes the post-delete chain.
-	s.reapplyActiveProfile()
+	if err := s.reapplyActiveProfile(); err != nil {
+		writeErr(w, 500, "配置已删除，但模型客户端更新失败: "+err.Error())
+		return
+	}
 	writeJSON(w, 200, map[string]any{"deleted": id})
 }
 
@@ -1929,12 +1979,26 @@ func (s *Server) pgActivateProfile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	// Validate before changing the persisted selection: a rejected activation
+	// must leave both the selected profile and its running provider untouched.
+	cfg, ok := s.loadProfileConfig(body.ID)
+	if !ok {
+		writeErr(w, 400, "配置不存在或未提供 API Key，无法激活")
+		return
+	}
+	if _, err := cfg.NewProvider(); err != nil {
+		writeErr(w, 400, "配置无效，无法激活: "+err.Error())
+		return
+	}
 	if err := pg.SetActiveProfile(body.ID); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
 	s.invalidateProfileAgents() // active change may affect pinned-task fallbacks
-	s.reapplyActiveProfile()    // switch the running engine to the newly activated profile
+	if err := s.reapplyActiveProfile(); err != nil {
+		writeErr(w, 500, "配置已切换，但模型客户端初始化失败: "+err.Error())
+		return
+	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -1978,11 +2042,12 @@ func (s *Server) pgLLMPoolReset(w http.ResponseWriter, r *http.Request) {
 // the OpenAI path, it falls back to the OpenAI endpoint at the stripped root.
 func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider  string `json:"provider"` // "openai" | "anthropic"
-		BaseURL   string `json:"base_url"`
-		APIKey    string `json:"api_key"`
-		Proxy     string `json:"proxy"`
-		ProfileID *int64 `json:"profile_id"` // fallback: use stored key from this profile
+		Provider  string  `json:"provider"` // "openai" | "anthropic"
+		BaseURL   string  `json:"base_url"`
+		APIKey    string  `json:"api_key"`
+		Proxy     string  `json:"proxy"`
+		ProfileID *int64  `json:"profile_id"` // fallback: use stored key from this profile
+		UserAgent *string `json:"user_agent"`
 	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1990,10 +2055,24 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	}
 	// Resolve API key: form input > profile stored key.
 	apiKey := strings.TrimSpace(req.APIKey)
-	if apiKey == "" && req.ProfileID != nil {
+	var userAgent string
+	if req.UserAgent != nil {
+		userAgent = *req.UserAgent
+	}
+	if req.ProfileID != nil && (apiKey == "" || req.UserAgent == nil) {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			apiKey = p.APIKey
+			if apiKey == "" {
+				apiKey = p.APIKey
+			}
+			if req.UserAgent == nil {
+				userAgent = p.UserAgent
+			}
 		}
+	}
+	userAgent, err := agent.NormalizeUserAgent(userAgent)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
 	}
 	if apiKey == "" {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": "未提供 API Key"})
@@ -2068,6 +2147,9 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		httpReq.Header = c.hdr
+		if userAgent != "" {
+			httpReq.Header.Set("User-Agent", userAgent)
+		}
 		resp, err := client.Do(httpReq)
 		if err != nil {
 			lastErr = "请求失败: " + err.Error()

@@ -74,6 +74,9 @@ type Config struct {
 	// 空 = 不发送。值由 transcript.WithSessionID 挂在请求 context 上,由 RoundTripper
 	// 读取填入,因此同一共享 provider 也能按会话发出不同的头值。
 	SessionHeaderKey string
+	// UserAgent overrides the SDK's User-Agent on every model request. Empty
+	// preserves the SDK / HTTP client's default.
+	UserAgent string
 	// Retry 是该配置解析后的重试参数(profile 覆盖 → 全局策略 → 内置默认,由
 	// server 侧解析)。三层的含义见 RetryConfig;零值 = 完全沿用内置默认。
 	Retry RetryConfig
@@ -254,7 +257,7 @@ func (c Config) Provider() string {
 // limiter lives on the single provider instance — so planner + all workers +
 // main agent (which share this provider) are bounded by one shared rate limit.
 func (c Config) NewProvider() (llm.Provider, error) {
-	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey)
+	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey, c.UserAgent)
 	if err != nil {
 		return nil, err
 	}
@@ -333,9 +336,17 @@ type quotaAwareTransport struct {
 	// carries; its value is the session id read from the request context. Empty
 	// disables it. See Config.SessionHeaderKey.
 	sessionHeaderKey string
+	userAgent        string
 }
 
 func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.sessionHeaderKey != "" || t.userAgent != "" {
+		// RoundTrippers must not mutate the caller's request or shared headers.
+		req = req.Clone(req.Context())
+		if req.Header == nil {
+			req.Header = make(http.Header)
+		}
+	}
 	// Custom session-id header: name is user-configured, value is THIS run's
 	// session id (norma stashes it on the context via transcript.WithSessionID).
 	// Stable across a session's turns and distinct across sessions — exactly what
@@ -344,6 +355,9 @@ func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error
 		if sid := transcript.SessionIDFrom(req.Context()); sid != "" {
 			req.Header.Set(t.sessionHeaderKey, sid)
 		}
+	}
+	if t.userAgent != "" {
+		req.Header.Set("User-Agent", t.userAgent)
 	}
 	// When LLM recording is on, the Recorder puts a Capture on the context so the
 	// raw wire bodies can be persisted. This is the only layer that still sees
@@ -397,7 +411,25 @@ func requestBodySnapshot(req *http.Request) string {
 	return string(b)
 }
 
-func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) {
+// NormalizeUserAgent validates before trimming so CR/LF cannot disappear into
+// whitespace normalization. UA values are a single line of printable ASCII.
+func NormalizeUserAgent(value string) (string, error) {
+	if len(value) > 512 {
+		return "", fmt.Errorf("User-Agent 最多 512 个字符")
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < 32 || value[i] > 126 {
+			return "", fmt.Errorf("User-Agent 只能包含可打印的 ASCII 字符，不能包含换行或控制字符")
+		}
+	}
+	return strings.TrimSpace(value), nil
+}
+
+func quotaAwareHTTPClient(proxy, sessionHeaderKey, userAgent string) (*http.Client, error) {
+	userAgent, err := NormalizeUserAgent(userAgent)
+	if err != nil {
+		return nil, err
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	proxy = strings.TrimSpace(proxy)
 	if proxy == "" {
@@ -416,7 +448,7 @@ func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) 
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
-	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey)}}, nil
+	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey), userAgent: userAgent}}, nil
 }
 
 // logTestConnection prints the raw HTTP status code(s) and response body of a
