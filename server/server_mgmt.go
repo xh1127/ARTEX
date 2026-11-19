@@ -854,10 +854,8 @@ func (s *Server) pgListMCP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if ms == nil {
-		ms = []*db.MCPServer{}
-	}
-	writeJSON(w, 200, map[string]any{"servers": ms})
+	// env values (process env / request headers) are credentials: masked, never echoed.
+	writeJSON(w, 200, map[string]any{"servers": maskedMCPServers(ms)})
 }
 
 func (s *Server) pgSaveMCP(w http.ResponseWriter, r *http.Request) {
@@ -871,6 +869,20 @@ func (s *Server) pgSaveMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	isNew := m.ID == 0
+	// The list returns env values masked; ones that come back still masked keep
+	// their stored value (same server only — see mergeMaskedMCPEnv).
+	var existing *db.MCPServer
+	if !isNew {
+		var err error
+		if existing, err = s.findMCPByID(m.ID); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if err := mergeMaskedMCPEnv(&m, existing); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	id, err := pg.SaveMCP(&m)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -1825,6 +1837,18 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The profile list returns the proxy with its password masked; a value that
+	// comes back still masked keeps the stored password (same proxy only).
+	storedProxy := ""
+	if existing != nil {
+		storedProxy = existing.Proxy
+	}
+	proxy, perr := resolveMaskedProxy(p.Proxy, storedProxy)
+	if perr != nil {
+		writeErr(w, 400, perr.Error())
+		return
+	}
+	p.Proxy = proxy
 	// Omitted by older clients: retain the saved UA. Explicit empty clears it.
 	if body.UserAgent != nil {
 		p.UserAgent = *body.UserAgent
@@ -2147,9 +2171,15 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build HTTP client with optional proxy.
+	// Build HTTP client with optional proxy. A masked password means the proxy
+	// stored on the profile being edited.
+	proxy, err := s.resolveLLMRequestProxy(req.Proxy, req.ProfileID)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
 	transport := &http.Transport{}
-	if p := strings.TrimSpace(req.Proxy); p != "" {
+	if p := strings.TrimSpace(proxy); p != "" {
 		if pu, err := url.Parse(p); err == nil {
 			transport.Proxy = http.ProxyURL(pu)
 		}

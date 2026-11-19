@@ -626,7 +626,7 @@ func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 		Name:             p.Name,
 		Format:           p.Format,
 		BaseURL:          p.BaseURL,
-		Proxy:            p.Proxy,
+		Proxy:            maskProxyURL(p.Proxy), // password masked; see proxy_mask.go
 		Model:            p.Model,
 		APIKeyHint:       p.APIKeyHint,
 		RatePerSecond:    p.RatePerSecond,

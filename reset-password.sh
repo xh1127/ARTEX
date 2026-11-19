@@ -63,6 +63,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# 命令行参数会出现在进程列表与 shell 历史里。不拒绝（自动化脚本可能依赖），但要提示。
+if [[ -n "$NEWPASS" || -n "$DBPASS" ]]; then
+  info "提示：-p/--new-password、-W/--db-password 会让密码留在进程列表与 shell 历史里；省略 -p 可改为交互输入，数据库密码可改用 PGPASSWORD 环境变量或 config.json"
+fi
+
 # ---- 从 config.json 读取 database.*（仅 local 模式、且未显式给出连接时）-----
 # 优先用 python3 解析（健壮）；缺 python3 时退回 grep（config.json 为规整分字段）。
 read_config_json() {
@@ -108,6 +113,43 @@ apply_config_fields() {
       SSLMODE)  [[ -z "$SSLMODE" ]] && SSLMODE="$val" ;;
     esac
   done
+}
+
+# split_dsn 把 DSN（URI 或 key=value 形式）拆成 apply_config_fields 认识的分字段，
+# 让数据库密码改走 PGPASSWORD 环境变量，而不是作为 psql 的命令行参数——argv 对本机
+# 所有用户可见（ps）。需要 python3（URL 解码、带引号的 key=value）；失败返回非零。
+split_dsn() {
+  python3 - "$1" <<'PY'
+import shlex, sys
+from urllib.parse import parse_qs, unquote, urlsplit
+d = sys.argv[1].strip()
+out = {}
+try:
+    if d.startswith(("postgres://", "postgresql://")):
+        u = urlsplit(d)
+        out = {"host": u.hostname, "port": u.port, "user": unquote(u.username or ""),
+               "password": unquote(u.password or ""), "dbname": unquote(u.path.lstrip("/"))}
+        q = parse_qs(u.query)
+        if q.get("sslmode"):
+            out["sslmode"] = q["sslmode"][0]
+    else:
+        for tok in shlex.split(d):
+            k, sep, v = tok.partition("=")
+            if sep:
+                out[k] = v
+except Exception:
+    sys.exit(1)
+if not (out.get("user") or out.get("dbname") or out.get("host")):
+    sys.exit(1)
+for k in ("host", "port", "user", "password", "dbname", "sslmode"):
+    if out.get(k):
+        print(k.upper() + "	" + str(out[k]))
+PY
+}
+
+# mask_dsn 去掉 DSN 里的密码，用于打印。
+mask_dsn() {
+  printf '%s' "$1" | sed -E "s#(://[^:/@]*:)[^@]*@#\1***@#; s/(password=)('[^']*'|[^ ]*)/\1***/"
 }
 
 # ---- 自动判定模式 ---------------------------------------------------------
@@ -164,8 +206,18 @@ if [[ "$MODE" == "local" ]]; then
 
   declare -a PSQL_ARGS=()
   if [[ -n "$DSN" ]]; then
+    # 不把 DSN 本身交给 psql：它带着数据库密码，而进程参数本机所有用户都能看到。
+    # 拆成分字段后走与 config.json 相同的路径，密码经 PGPASSWORD 传递。
+    if command -v python3 >/dev/null 2>&1 && parts=$(split_dsn "$DSN") && [[ -n "$parts" ]]; then
+      DSN=""
+      apply_config_fields <<<"$parts"
+    else
+      info "警告：无法拆分 DSN（缺少 python3 或格式无法识别），将作为命令行参数传给 psql——本机其他用户可经 ps 看到其中的数据库密码"
+    fi
+  fi
+  if [[ -n "$DSN" ]]; then
     PSQL_ARGS=("$DSN")
-    target="$DSN"
+    target="$(mask_dsn "$DSN")"
   else
     [[ -n "$USER"   ]] || die "缺少数据库用户（-U）或有效的 config.json/DSN"
     [[ -n "$DBNAME" ]] || die "缺少数据库名（-d）或有效的 config.json/DSN"

@@ -280,3 +280,48 @@ func TestSteerWorkNeverStrandsMessageAfterDetach(t *testing.T) {
 		}
 	}
 }
+
+// A worker that reaches the delete barrier must park, not exit: when the delete
+// is aborted, AbortDelete clears the flags but nothing restarts loops (Run only
+// nudges a task that is still started), so a returned worker was lost for good.
+func TestWorkerParksDuringDeleteAndResumesAfterAbort(t *testing.T) {
+	task := &Task{ID: "t-del", notify: make(chan struct{}, 1)}
+	e := NewEngine(&Manager{tasks: map[string]*Task{task.ID: task}})
+	var resolves atomic.Int32
+	e.SetAuthoritativeAgentResolver(func(*Task) (*agent.Planner, *agent.Worker) {
+		resolves.Add(1)
+		return nil, nil // no LLM: an idle worker resolves, sleeps, repeats
+	})
+	// Only the deleting flag, as a worker sees it in the window before BeginDelete
+	// raises the pause barrier.
+	e.deleting.Store(task.ID, true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		e.workerLoop(ctx, task, "w1")
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("worker exited on the delete barrier; an aborted delete would lose it")
+	case <-time.After(1500 * time.Millisecond):
+	}
+	if n := resolves.Load(); n != 0 {
+		t.Fatalf("parked worker resolved agents %d times", n)
+	}
+	e.AbortDelete(task.ID, false)
+	deadline := time.Now().Add(5 * time.Second)
+	for resolves.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("worker did not resume after the delete was aborted")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel() // a completed delete ends the loop through its context
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not exit when its context was cancelled")
+	}
+}

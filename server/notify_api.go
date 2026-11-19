@@ -127,6 +127,7 @@ func (s *Server) notifyMeta(w http.ResponseWriter, r *http.Request) {
 	}
 	baseURL, _, _ := pg.GetSetting(settingNotifyPublicBaseURL)
 	digest, _, _ := pg.GetSetting(settingNotifyDigestMinutes)
+	proxy, _, _ := pg.GetSetting(settingNotifyProxy)
 	stats, err := pg.NotificationStatsSnapshot(r.Context())
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -137,6 +138,7 @@ func (s *Server) notifyMeta(w http.ResponseWriter, r *http.Request) {
 		"enabled":             pg.GetBool(settingNotifyEnabled, true),
 		"public_base_url":     baseURL,
 		"digest_interval_min": digest,
+		"proxy":               maskProxyURL(proxy), // password masked
 		"defaults": map[string]any{
 			"digest_interval_min": notifyDefaultDigestMinutes,
 		},

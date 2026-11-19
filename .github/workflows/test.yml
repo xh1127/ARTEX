@@ -35,9 +35,9 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -46,6 +46,15 @@ jobs:
       # start), so there is no migration step to run here.
       - name: go vet
         run: go vet ./...
+
+      # The embedui build (go:embed of the exported UI) is otherwise compiled
+      # only by release builds, so a break in webui_embed.go surfaced at tag
+      # time. Compile it against a placeholder page; the real UI isn't needed.
+      - name: go build -tags embedui
+        run: |
+          mkdir -p server/webui/dist
+          [ -e server/webui/dist/index.html ] || echo '<!doctype html>' > server/webui/dist/index.html
+          go build -tags embedui ./...
 
       # Blocking: the failures that used to make this informational have been
       # fixed (profile-cleanup ordering in the chat tests, Windows-only evidence
@@ -62,8 +71,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: "22"
           cache: npm

@@ -1024,7 +1024,16 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 			continue // user-paused: don't claim/execute intents
 		}
 		if e.IsDeleting(t.ID) {
-			return
+			// Park here too rather than exit. A worker that slipped past the pause
+			// check just before BeginDelete raised the barrier lands here; had it
+			// returned, an aborted delete (AbortDelete clears the flags, and Run
+			// only nudges a task that is still "started") would leave the task a
+			// worker short until restart. A completed delete ends us through
+			// StopTask, which cancels this context before it waits.
+			if sleepCtx(ctx, 1000*time.Millisecond) {
+				return
+			}
+			continue
 		}
 		if e.isSettling(t.ID) {
 			if sleepCtx(ctx, 1000*time.Millisecond) {
@@ -1046,7 +1055,11 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 			continue
 		}
 		if !e.beginTaskOperation(t.ID) {
-			return
+			// A delete barrier went up after the checks above: park, as above.
+			if sleepCtx(ctx, 1000*time.Millisecond) {
+				return
+			}
+			continue
 		}
 		claimed := e.runWorkerStep(ctx, t, name, worker)
 		e.decInflight(t.ID)
@@ -1083,8 +1096,22 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	emit := func(r db.Activity) { e.emitActivity(t, r) }
 	ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
 	if ectx.Err() != nil || e.IsDeleting(t.ID) {
-		if err := transitionIntentState(t.Store, intent.ID, "running", "open"); err != nil {
+		back := "open"
+		if hasChatMessage {
+			// This run exists to deliver a human message and never started (the
+			// task was paused between the handler's check and here), so the
+			// message is not in the transcript. Back on the frontier, a pool
+			// worker would re-run the intent without it after the resume — while
+			// the UI already shows the message as sent. Park the intent where the
+			// user left it (paused) and say so, so the message can be sent again.
+			back = "paused"
+		}
+		if err := transitionIntentState(t.Store, intent.ID, "running", back); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 领取后回退失败: %v", name, t.ID, intent.ID, err)
+		} else if hasChatMessage && !e.IsDeleting(t.ID) {
+			uid := intent.ID
+			e.emitActivity(t, db.Activity{NodeID: &uid, Worker: "system", Kind: "text",
+				Summary: "上一条消息未送达：发送时任务已被暂停。恢复任务后请重新发送。"})
 		}
 		return true
 	}

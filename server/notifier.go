@@ -23,6 +23,10 @@ const (
 	settingNotifyPublicBaseURL = "notify_public_base_url"
 	// settingNotifyDigestMinutes 是汇总模式的周期（分钟）。
 	settingNotifyDigestMinutes = "notify_digest_interval_min"
+	// settingNotifyProxy 是 HTTP 推送渠道的显式代理（http/https/socks5，空=直连）。
+	// 环境变量里的代理对推送不生效（会让 SSRF 拨号守卫失效）；必须经代理才能到达
+	// IM 平台的环境（如访问 Telegram）在这里单独配置。邮件渠道不走代理。
+	settingNotifyProxy = "notify_proxy"
 )
 
 const (

@@ -136,6 +136,13 @@ func (s *Server) syncSSDatasource(w http.ResponseWriter, r *http.Request) {
 	if m == nil {
 		m = &db.MCPServer{Name: scopeSentryMCPName, Transport: "http", Env: json.RawMessage(`{"X-API-Key":""}`)}
 	}
+	// The stored key is no longer readable through the API (GET /api/mcp masks
+	// it), so it must not be sendable to a new address either: moving the URL to
+	// another origin requires entering the key again.
+	if body.URL != "" && body.APIKey == "" && m.URL != "" && envHasValue(m.Env) && !sameURLOrigin(m.URL, body.URL) {
+		writeErr(w, 400, errKeyDestinationChanged)
+		return
+	}
 	if body.URL != "" {
 		m.URL = body.URL
 	}

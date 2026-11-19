@@ -1,10 +1,10 @@
 # ARTEX 开发交接文档（换机迁移）
 
-> 生成时间：2026-11-18 · 来源机器：Windows 10 Pro (win32, Git Bash)
-> 源工作区：`D:\code\ARTEX` · 基线 `main` @ `51291fe`
-> **工作分支：`handoff/llm-user-agent` @ `608bb58`（已推送）**
-> 远端：`github` → `https://github.com/xh1127/ARTEX.git`（可写，分支跟踪它）
->       `origin` → `https://gh-proxy.org/https://github.com/xh1127/ARTEX.git`（只读镜像，`main` 跟踪它）
+> 生成时间：2026-11-18 · 最近更新：2026-11-19（审查与修复之后）
+> 工作区：`D:\code\ARTEX` · 基线 `main` @ `51291fe`
+> **工作分支：`handoff/llm-user-agent`（已推送到 `xh1127/ARTEX`，当前提交见 `git log`）**
+> 远端：`origin` → `https://ghfast.top/https://github.com/xh1127/ARTEX.git`（加速镜像，只用来拉取）
+>       推送直接用地址：`git push https://github.com/xh1127/ARTEX.git handoff/llm-user-agent`
 
 这份文档解决三件事：**代码在哪**、**新机器怎么起来**、**接下来该做什么**。
 
@@ -42,7 +42,7 @@
 
 ## 2. 代码怎么带过去
 
-代码已经推到 `xh1127/ARTEX` 的 **`handoff/llm-user-agent`** 分支（提交 `608bb58`，30 个文件 +2536/−370）。不要再从旧工作区拷贝。
+代码在 `xh1127/ARTEX` 的 **`handoff/llm-user-agent`** 分支上。不要再从旧工作区拷贝。
 
 ### 方案 A（推荐）：直接克隆分支
 
@@ -52,19 +52,13 @@ cd ARTEX
 git switch handoff/llm-user-agent
 ```
 
-新机器访问 GitHub 慢时，先用镜像克隆、再补一个直连远端取分支：
+访问 GitHub 慢时，可以用加速镜像克隆（`https://ghfast.top/https://github.com/xh1127/ARTEX.git`），但**镜像只能拉取**。推送要直连 GitHub：
 
 ```bash
-git clone https://gh-proxy.org/https://github.com/xh1127/ARTEX.git
-cd ARTEX
-git remote add github https://github.com/xh1127/ARTEX.git
-git fetch github handoff/llm-user-agent
-git switch handoff/llm-user-agent
+git push https://github.com/xh1127/ARTEX.git handoff/llm-user-agent
 ```
 
-> **注意 `origin` 是只读的。** `gh-proxy.org` 只做拉取镜像，`git push origin` 会报
-> `remote: No anonymous write access.`。推送必须用 `github` 这个远端：
-> `git push -u github handoff/llm-user-agent`。
+> 推送用的 token 需要 **`repo` 和 `workflow`** 两个权限（分支里有对 `.github/workflows/` 的改动，缺 `workflow` 会被拒）。GitHub 不接受账号密码；在 Git Credential Manager 的登录框里，用户名填 GitHub 账号，密码处粘贴 token。
 
 ### 方案 B（备用）：用补丁 / bundle
 
@@ -176,7 +170,9 @@ npm run check          # biome check
 - **需要独立测试库**：`db`、`agent`、`server`、`evidence` 四个包都有 `TestMain`，会在 `ARTEX_PG_DSN` 指向的库上取 **PostgreSQL 咨询锁 7337741002** 来串行化跨包清理（`server/testmain_test.go`、`db/testmain_test.go` 等）。所以**别指向生产库**，测试会 `DELETE` 数据。
 - **静默跳过**：`requestHeadersDatabase()`（`server/llm_request_headers_test.go:14`）在 DSN 为空时 `t.Skip`。新增的 9 个测试文件几乎全靠它，因此**没设 DSN 就等于没测**。
 
-> CI 现状：`.github/workflows/` 只有 `release.yml`（打 tag 时构建五平台）和 `manual-build.yml`（手工构建 Windows amd64），**两个都没有 `go test` 步骤**。想在 CI 上跑测试需要自己加一个带 `postgres:16` service 的 job。
+> CI 现状：`.github/workflows/test.yml` 在推送到 `main` / `handoff/**` 和 PR 时运行——`go vet`、带 `-tags embedui` 的编译、`go test`（带 `postgres:16` service，**阻断**）、前端 `tsc`（阻断）与 `biome check`（暂不阻断，存量问题未清）。`release.yml`（打 tag 构建五平台）与 `manual-build.yml`（手工构建 Windows amd64）本身不跑测试。
+>
+> 没有配置数据库时，依赖数据库的测试会**跳过**（不再报失败）；所以本地全绿不代表这些测试跑过，以 CI 为准。
 
 ---
 
@@ -212,36 +208,32 @@ server/llm_test_token_field_test.go server/llm_user_agent_test.go
 
 ---
 
-## 6. 已知问题与待办（按建议优先级）
+## 6. 已知问题与待办
 
-以下都是本次审查得出的结论，不是猜测；行号以当前工作区为准。
+2026-11-19 做过一轮全项目审查与修复，详见 `CHANGELOG.md` 的 `[Unreleased]`。本节原先列出的条目（搜索凭据用错配置、CI 不跑测试、已落库却回 500、`web_search` 无 panic 兜底、重试无上限、死 setter、构建失败原因不可见等）都已处理。
 
-### 高
+### 升级后行为有变化的地方
 
-1. **`deepSeekSearchCreds` 用「激活配置」而非「调用方绑定的配置」** — `server/manager.go:576`
-   `WebSearchOpts()` 没有 agent 上下文，被 pin 到便宜 profile 的任务，搜索请求走的是另一个 profile 的 key/base_url/UA。费用记错对象，网关按 UA 的风控/限流分组也会错位。属既有问题，UA 特性让它更明显。
-2. **测试在 CI 上永远跳过** — 见 §4。新增的并发修复没有回归保护。建议加带 `postgres:16` service 的 `go test ./...` job。
-3. **「已落库但回 500」的部分成功语义** — `server/server_mgmt.go:1875` 等处
-   配置已提交、内存态已发布，却返回 500，前端按失败处理。同一模式出现在 `pgSaveLLMRetryPolicy`、`pgDeleteProfile`、`pgActivateProfile`、`putSettings` 的 `traffic.SetUpstreamProxy` 分支。建议改成 `200 + warning` 字段。
+`CHANGELOG.md` 的「安全加固 → 行为变化」一节是完整清单，最容易踩到的三条：
 
-### 中
+1. 首次打开 `/setup` 需要填**初始化令牌**（启动日志，或程序目录下的 `setup-token` 文件）。
+2. 改了 LLM 的 Base URL、代理地址、MCP 的 URL 之后，对应的 Key / 密码 / 请求头要**重新填写**。
+3. 推送不再读取 `HTTP(S)_PROXY`；需要代理的话在「推送」页填**推送代理**。
 
-4. **`configureWebSearch` 绕过后置处理** — `agent/websearch.go:28`
-   它 append 到 `opts.Tools`，位于 `AugmentTools` 的 `ToolResolve`（DB 工具表过滤/描述覆盖）、`findingWorkflowTools`、`guardPanic` **之后**。后果：工具页禁用 `web_search` 无效，也不被 panic 兜底。
-5. **`configureWebSearch` 静默吞错**：`newWebSearch` 失败时工具凭空消失、无日志。配置错了（UA 非法、代理串错）只能靠人猜。建议 `log.Printf`。
-6. **`putSettings` 直写 Manager 私有字段，留下 7 个死 setter**：`SetWebSearch`、`SetGlobalProxy`、`SetLLMRecordEnabled`、`SetNoaCompaction`、`SetWorkers`、`SetLLMPoolEnabled`、`SetLLMPoolBindFallback` 现在只有测试在用。其中 `SetGlobalProxy` 自带 `syncBrowserMCPProxy()` 副作用，将来谁改回 setter 就会与 handler 路径分叉。
-7. **激活配置构建失败会整站停摆且 UI 看不到原因** — `server/server.go:458` `s.llmOn = err == nil && prov != nil`。语义更正确，但 `getLLM` 只回 `configured:false`、没有 error 字段。
-8. **`applyLLM` 的 busy-retry 无上限** — `server/server.go:419` 的 `for { ... continue }`。频繁保存配置理论上是忙等。
-9. **`reapplyActiveProfile` 把 `s.llmCfg` 当 env fallback** — `server/server.go:381`。删除激活配置后会拿刚删掉那个配置的副本重建，日志来源变成空字符串。
+### 仍未处理（有意为之，改之前先想清楚）
 
-### 低
+- **更新包没有签名**：`SHA256SUMS` 与安装包来自同一个 Release，只防损坏不防篡改。要做签名得先决定密钥由谁保管。
+- **一键更新的仓库地址写死为上游 `Autumn-27/artex`**（`selfupdate/github.go`）。本 fork 用 `manual-build.yml` 且**版本号留空**出包（`v0.0.0-manual.*`，一键更新自动禁用）。要走自己的版本线，先把 `Repo` 改成 fork，并处理 `release.yml` 里推送到 `autumn27/artex` 的 Docker 步骤。
+- **实时推送的 token 在 URL 里**（EventSource 不能带请求头）。README 的反代一节有访问日志的建议；彻底解决需要改成一次性的连接票据，并处理四处 EventSource 的重连逻辑。
+- **LLM / MCP 地址没有 SSRF 限制**：加了会挡住本机的 ollama 等合法用法。
+- **自定义工具（HTTP 类型）的请求头与代理仍原样回显**：与 MCP 是同一类问题，尚未打码。
+- **目标拆解到一半被打断**时可能只留下部分目标，任务会带着不完整的目标继续跑。
+- `server/server.go` 仍然很大；`agentsForTask` 在查库与构建 provider 期间持有全局锁，任务很多时会互相等待。
+- 前端 `biome check` 有约 135 个存量错误，CI 里这一步暂不阻断。
 
-- `ProbeWebSearch` 里的 `t.(*deepSeekSearchTool)` 强制断言可去掉（backend 已判过）。
-- `max_uses: min(max((limit+9)/10, 1), 3)` 建议加一行注释。
-- `db/schema.sql` 新列没加 CHECK（同表 `max_tokens` 有 `CHECK >= 0`），512 限制只在 Go 层。
-- **`CHANGELOG.md` 的 `[Unreleased]` 是空的**——本次改动量与 0.3.15 任一条相当，建议补。
-- `server/server.go` 已 3971 行，`putSettings` 单函数约 200 行，建议拆三段。
-- `pgListModels` 用裸 `&http.Transport{}`（无 Timeout），与 `quotaAwareHTTPClient` 不一致。
+### 还没审查过的部分
+
+前端的大部分页面与组件、`db` 层的大部分、`report` / `enrich` / `guard` / `intercept` / `sidequestion`、skills、任务归档与证据导出、`start.bat`。
 
 ---
 
@@ -286,25 +278,24 @@ web/                Next.js 16 前端（210 个受版本控制的文件）
 
 git 会大量提示 `LF will be replaced by CRLF the next time Git touches it`——这是正常的，不是错误。
 
-### B. 前端 dev 端口与文档不一致
+### B. 前端 dev 端口
 
-`dev.sh:19` 与 `README.md:275` 都打印 `http://localhost:5173`，但 `web/package.json` 的 `dev` 脚本是裸 `next dev`，**没有 `-p`**，Next 16 默认跑 **3000**。仓库里也找不到任何 `.env.local` 或端口配置。
-
-→ 实际访问 **http://localhost:3000**。要么改文档，要么在 `web/package.json` 里加 `"dev": "next dev -p 5173"`。这是文档缺陷，换机后第一次跑就会遇到。
+`web/package.json` 的 `dev` 脚本固定为 `next dev -p 5173`，与 `dev.sh`、README 一致：开发时访问 **http://localhost:5173**。
 
 ### C. 端口占用
 
 `:8787`（后端+前端 API）、`:8788`（录制代理，仅监听 127.0.0.1）、`:5432`（Postgres）。`docker-compose.bench.yml` 会再占一套，基准测试前先停掉常规服务。
 
-### D. 代理相关（三套，别混）
+### D. 代理相关（四套，别混）
 
 | 配置项 | 作用范围 |
 |---|---|
 | 每个 LLM profile 的 `proxy` | 只影响该 profile 的模型请求 |
 | `global_proxy`（系统设置） | 所有**目标**流量；录制开启时成为 MITM 的上游 |
 | `web_search_proxy`（系统设置） | 只影响搜索后端出口 |
+| `notify_proxy`（推送页 · 全局设置） | 只影响 Webhook 类推送渠道；邮件始终直连 |
 
-留空 = 直连（**不回退** `HTTP_PROXY`/`HTTPS_PROXY` 环境变量，`agent/provider.go:436` 显式 `transport.Proxy = nil`）。
+留空 = 直连。四者都**不回退** `HTTP_PROXY`/`HTTPS_PROXY` 环境变量。带密码的代理地址回显时密码显示为 `__masked__`，原样保存即沿用。
 
 ### E. 不要跨环境复制的运行时文件
 
@@ -321,8 +312,7 @@ git 会大量提示 `LF will be replaced by CRLF the next time Git touches it`�
 1. 装 Go 1.26.3+ / Node 20+ / PostgreSQL 16
 2. 拿代码（§2），装依赖 `cd web && npm ci`
 3. 起库、写 `config.json`
-4. **跑 §4 的验收**——特别是带 `ARTEX_PG_DSN` 的 `go test ./...`，这是本次改动第一次真正被验证
-5. `./dev.sh` 起来，走 `/setup` → 配 LLM → 在「LLM 配置」页验证 UA 字段（连接测试 + 加载模型都应带新 UA）
-6. 补 `CHANGELOG.md` 的 `[Unreleased]`（分支上的改动量与 0.3.15 任一条相当）
-7. 按 §6 处理高优先级三条；其中第 2 条（CI 跑测试）建议最先做
-8. 验证通过后合入 `main`，推送用 `git push github main`（`origin` 只读）
+4. 跑 §4 的验收；需要数据库的测试以 CI（`test` workflow）的结果为准
+5. `./dev.sh` 起来，按启动日志里的**初始化令牌**走 `/setup` → 配 LLM
+6. 出包：Actions → **Build Windows amd64** → Run workflow，分支选工作分支，**版本号留空**
+7. 验证通过后合入 `main`

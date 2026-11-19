@@ -323,6 +323,12 @@ export default function MCPPage() {
             value={form.env}
             onChange={(e) => setF({ env: e.target.value })}
           />
+          {editing && (
+            <p className="text-muted-foreground text-xs">
+              已保存的值显示为 __masked__（带末 6 位提示），保持不动即沿用；要修改某一项，把该行的值整个重填。
+              {form.transport !== "stdio" ? "改了 URL 的域名或端口后，需要重新填写这些值。" : ""}
+            </p>
+          )}
         </div>
       </div>
     );

@@ -24,6 +24,7 @@ import (
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
+	"github.com/Autumn-27/artex/notify"
 	"github.com/Autumn-27/artex/report"
 	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/norma/llm"
@@ -42,10 +43,11 @@ type Server struct {
 	engine *Engine
 	ctx    context.Context
 
-	skillDir string       // root directory for skill subdirectories
-	jwtKey   []byte       // HS256 signing key loaded from / generated into dataDir/jwt.key
-	setup    *setupGate   // one-time token gating /api/auth/init until a password exists
-	pwEpoch  pwEpochCache // when the password last changed; older tokens are rejected
+	skillDir   string       // root directory for skill subdirectories
+	jwtKey     []byte       // HS256 signing key loaded from / generated into dataDir/jwt.key
+	setup      *setupGate   // one-time token gating /api/auth/init until a password exists
+	pwEpoch    pwEpochCache // when the password last changed; older tokens are rejected
+	loginLimit loginLimiter // backoff for password / setup-token guessing on /api/auth/*
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -254,6 +256,11 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
 		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
+		if proxy, _, _ := m.pg.GetSetting(settingNotifyProxy); strings.TrimSpace(proxy) != "" {
+			if err := notify.SetProxy(proxy); err != nil {
+				log.Printf("[notify] 已保存的通知代理无效，推送改为直连: %v", err)
+			}
+		}
 		go newNotifier(s).Run(s.ctx)
 		// Fill the tool cache for any enabled MCP that has none yet (notably the
 		// seeded browser MCP on first run). Async so it never blocks startup.
@@ -421,11 +428,38 @@ func (s *Server) reapplyActiveProfile() error {
 // webSearchFor gates the global web-search opts (backend/key) by an agent's own
 // web_search flag: the backend/key come from the global config, each agent decides on/off.
 func (s *Server) webSearchFor(key string) agent.WebSearchOpts {
-	o := s.m.WebSearchOpts()
+	return s.gateSearchForAgent(key, s.m.WebSearchOpts())
+}
+
+// webSearchForCfg is webSearchFor for a role that already resolved the LLM
+// config it runs on. It lends that config's credentials to the DeepSeek backend
+// and reads the active profile only when the config cannot serve it — the old
+// per-run path read the active profile first and then discarded it.
+func (s *Server) webSearchForCfg(key string, cfg agent.Config) agent.WebSearchOpts {
+	o := s.m.webSearchBaseOpts()
+	if o.Backend == deepSeekWebSearchBackend {
+		if cfgServesSearch(cfg) {
+			o = mergeSearchCreds(o, cfg)
+		} else {
+			o.DeepSeekBaseURL, o.DeepSeekAPIKey, o.DeepSeekModel, o.DeepSeekUserAgent = s.m.deepSeekSearchCreds()
+		}
+	}
+	return s.gateSearchForAgent(key, o)
+}
+
+// gateSearchForAgent applies the agent's own web_search switch to the global opts.
+func (s *Server) gateSearchForAgent(key string, o agent.WebSearchOpts) agent.WebSearchOpts {
 	if a, err := s.m.pg.GetAgentByKey(key); err != nil || a == nil || !a.WebSearch {
 		o.Enabled = false
 	}
 	return o
+}
+
+// cfgServesSearch reports whether cfg can lend its credentials to the DeepSeek
+// search backend: it speaks the Anthropic Messages API (POST <base>/v1/messages
+// with x-api-key), so the config must be anthropic-format and complete.
+func cfgServesSearch(cfg agent.Config) bool {
+	return cfg.Provider() == "anthropic" && cfg.BaseURL != "" && cfg.APIKey != "" && cfg.Model != ""
 }
 
 // mergeSearchCreds replaces the DeepSeek backend's borrowable credentials with
@@ -440,10 +474,7 @@ func (s *Server) webSearchFor(key string) agent.WebSearchOpts {
 // (POST <base>/v1/messages with x-api-key), so borrowing an OpenAI-format
 // profile would send every search to an endpoint that cannot answer it.
 func mergeSearchCreds(o agent.WebSearchOpts, cfg agent.Config) agent.WebSearchOpts {
-	if o.Backend != deepSeekWebSearchBackend {
-		return o
-	}
-	if cfg.Provider() != "anthropic" || cfg.BaseURL == "" || cfg.APIKey == "" || cfg.Model == "" {
+	if o.Backend != deepSeekWebSearchBackend || !cfgServesSearch(cfg) {
 		return o
 	}
 	o.DeepSeekBaseURL, o.DeepSeekAPIKey, o.DeepSeekModel = cfg.BaseURL, cfg.APIKey, cfg.Model
@@ -1441,7 +1472,7 @@ func (s *Server) getLLM(w http.ResponseWriter, r *http.Request) {
 		"provider":         s.llmCfg.Provider(),
 		"model":            s.llmCfg.Model,
 		"base_url":         s.llmCfg.BaseURL,
-		"proxy":            s.llmCfg.Proxy,
+		"proxy":            maskProxyURL(s.llmCfg.Proxy),
 		"user_agent":       s.llmCfg.UserAgent,
 		"key_set":          s.llmCfg.APIKey != "",
 		"rate_per_second":  s.llmCfg.RatePerSecond,
@@ -1470,7 +1501,13 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
+	// The UI shows a saved proxy with its password masked; unedited, keep it.
+	proxy, err := s.resolveLLMRequestProxy(req.Proxy, nil)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, proxy)
 	cfg.RatePerSecond, cfg.RatePerMinute = req.RatePerSecond, req.RatePerMinute
 	cfg.ThinkingType = req.ThinkingType
 	cfg.ReasoningEffort = req.ReasoningEffort
@@ -1538,7 +1575,14 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
+	// A saved proxy is shown with its password masked; unedited, it means the
+	// stored one (of the profile under test, else of the applied config).
+	proxy, err := s.resolveLLMRequestProxy(req.Proxy, req.ProfileID)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, proxy)
 	// mirror production: send the SAME thinking params so a provider that rejects the
 	// reasoning_effort/thinking field fails the test too (no false "test ok, run 400").
 	cfg.ThinkingType = req.ThinkingType
@@ -3472,6 +3516,12 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.settingsPayload())
 }
 
+// notifyProxySetting returns the stored proxy for HTTP notification channels.
+func notifyProxySetting(pg *db.DB) string {
+	v, _, _ := pg.GetSetting(settingNotifyProxy)
+	return strings.TrimSpace(v)
+}
+
 func (s *Server) settingsPayload() map[string]any {
 	on, backend, braveKey, tavilyKey, proxy := s.m.WebSearch()
 	pyStored, _, _ := s.m.pg.GetSetting(settingPythonInterp)
@@ -3487,12 +3537,12 @@ func (s *Server) settingsPayload() map[string]any {
 		"web_search_backend":       backend,
 		"brave_key_set":            strings.TrimSpace(braveKey) != "",
 		"tavily_key_set":           strings.TrimSpace(tavilyKey) != "",
-		"web_search_proxy":         proxy,                       // 独立出口代理(http/https/socks5)，空=直连
-		"global_proxy":             s.m.GlobalProxy(),           // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
-		"python_interpreter":       strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
-		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
-		"task_concurrency_enabled": concOn,                      // 任务并发上限开关(默认关)
-		"task_concurrency_limit":   concLimit,                   // 同时运行任务上限(开启后默认5)
+		"web_search_proxy":         maskProxyURL(proxy),             // 独立出口代理(http/https/socks5)，空=直连；密码打码
+		"global_proxy":             maskProxyURL(s.m.GlobalProxy()), // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连；密码打码
+		"python_interpreter":       strings.TrimSpace(pyStored),     // 用户/自动设的值(空=用运行时检测)
+		"workers":                  s.m.Workers(),                   // 并发工作 agent 数(默认3)；对之后启动的任务生效
+		"task_concurrency_enabled": concOn,                          // 任务并发上限开关(默认关)
+		"task_concurrency_limit":   concLimit,                       // 同时运行任务上限(开启后默认5)
 		// LLM 轮询(故障转移)。默认关；开启后走全局激活配置的 agent 在当前配置不可用时
 		// 自动切到下一个配置。bind_fallback 仅在轮询开启时有意义(默认关)。
 		"llm_pool_enabled":       s.m.LLMPoolEnabled(),
@@ -3508,6 +3558,7 @@ func (s *Server) settingsPayload() map[string]any {
 		"notify_enabled":             s.m.pg.GetBool(settingNotifyEnabled, true),
 		"notify_public_base_url":     notifyPublicBaseURL(s.m.pg),
 		"notify_digest_interval_min": notifyDigestIntervalMin(s.m.pg),
+		"notify_proxy":               maskProxyURL(notifyProxySetting(s.m.pg)), // HTTP 推送渠道的代理，空=直连；密码打码
 	}
 }
 
@@ -3580,6 +3631,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		NotifyEnabled    *bool   `json:"notify_enabled"`
 		NotifyBaseURL    *string `json:"notify_public_base_url"`
 		NotifyDigestMins *int    `json:"notify_digest_interval_min"`
+		NotifyProxy      *string `json:"notify_proxy"` // HTTP 推送渠道的代理(http/https/socks5)；null=不改，""=直连
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -3605,7 +3657,24 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "workers 必须 >0")
 		return
 	}
-	for _, proxy := range []*string{req.GlobalProxy, req.WebSearchProxy} {
+	// The proxies are returned with their password masked; a value that comes
+	// back still masked keeps the stored password (same proxy only).
+	_, _, _, _, storedSearchProxy := s.m.WebSearch()
+	for _, pair := range []struct {
+		proxy  *string
+		stored string
+	}{{req.GlobalProxy, s.m.GlobalProxy()}, {req.WebSearchProxy, storedSearchProxy}, {req.NotifyProxy, notifyProxySetting(s.m.pg)}} {
+		if pair.proxy == nil {
+			continue
+		}
+		resolved, err := resolveMaskedProxy(*pair.proxy, pair.stored)
+		if err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		*pair.proxy = resolved
+	}
+	for _, proxy := range []*string{req.GlobalProxy, req.WebSearchProxy, req.NotifyProxy} {
 		if proxy != nil {
 			*proxy = strings.TrimSpace(*proxy)
 			if *proxy != "" {
@@ -3646,6 +3715,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	for key, value := range map[string]*string{
 		settingNotifyPublicBaseURL: req.NotifyBaseURL,
+		settingNotifyProxy:         req.NotifyProxy,
 		settingPythonInterp:        req.PythonInterp,
 		settingGlobalProxy:         req.GlobalProxy,
 		settingWebSearchBackend:    req.WebSearchBackend,
@@ -3723,6 +3793,11 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			warnings = append(warnings, "全局代理已保存，但流量代理上游更新失败: "+err.Error())
 		}
 	}
+	if req.NotifyProxy != nil {
+		if err := notify.SetProxy(*req.NotifyProxy); err != nil {
+			warnings = append(warnings, "通知代理已保存，但未能生效: "+err.Error())
+		}
+	}
 	if req.GlobalProxy != nil || req.TrafficCapture != nil {
 		s.m.syncBrowserMCPProxy()
 	}
@@ -3768,13 +3843,19 @@ func (s *Server) testWebSearch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	_, backend, storedBraveKey, storedTavilyKey, _ := s.m.WebSearch()
+	_, backend, storedBraveKey, storedTavilyKey, storedProxy := s.m.WebSearch()
 	if strings.TrimSpace(req.Backend) != "" {
 		backend = req.Backend
 	}
 	// Proxy is taken from the form as-is (empty = direct), so testing reflects exactly
 	// what's shown — including an intentional "clear proxy to test direct" before saving.
-	proxy := strings.TrimSpace(req.Proxy)
+	// The form shows the saved proxy with its password masked; unedited, it means
+	// the saved one.
+	proxy, err := resolveMaskedProxy(req.Proxy, storedProxy)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
 	// API keys are secrets the form omits when already saved, so fall back to stored.
 	braveKey := storedBraveKey
 	if strings.TrimSpace(req.BraveKey) != "" {

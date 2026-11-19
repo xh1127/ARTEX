@@ -360,6 +360,7 @@ export default function SystemSettingsPage() {
             </div>
             <p className="text-muted-foreground text-xs">
               {globalProxyInput.trim() ? "已配置 · 所有目标流量经此代理出网" : "未配置 · 目标流量直连出网"}
+              。已保存的代理密码显示为 __masked__，保持不动即沿用原密码；改了代理地址需重新填写密码。
             </p>
           </CardContent>
         </Card>
@@ -595,6 +596,7 @@ export default function SystemSettingsPage() {
                 </div>
                 <p className="text-muted-foreground text-xs">
                   独立出口代理，仅用于访问搜索端点（VPN/SOCKS 等）。与记录流量的 MITM 代理无关；网络不通时经此代理访问。
+                  已保存的代理密码显示为 __masked__，保持不动即沿用原密码。
                 </p>
               </div>
             )}

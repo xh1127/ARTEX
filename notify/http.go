@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -130,17 +131,89 @@ var notifyTransport = func() *http.Transport {
 // bot token）**就在 URL 里**，跟随跨主机跳转等于把凭据交给重定向目标。同主机
 // 的跳转（如末尾补斜杠）仍允许。
 var httpClient = &http.Client{
-	Timeout:   15 * time.Second,
-	Transport: notifyTransport,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 5 {
-			return errors.New("重定向次数过多")
-		}
-		if len(via) > 0 && req.URL.Host != via[0].URL.Host {
-			return fmt.Errorf("拒绝跨主机重定向（%s → %s）", via[0].URL.Host, req.URL.Host)
+	Timeout:       15 * time.Second,
+	Transport:     notifyTransport,
+	CheckRedirect: checkNotifyRedirect,
+}
+
+func checkNotifyRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 5 {
+		return errors.New("重定向次数过多")
+	}
+	if len(via) > 0 && req.URL.Host != via[0].URL.Host {
+		return fmt.Errorf("拒绝跨主机重定向（%s → %s）", via[0].URL.Host, req.URL.Host)
+	}
+	return nil
+}
+
+// proxiedClient 是配置了「通知代理」时使用的客户端；nil = 直连（默认，走 httpClient）。
+//
+// 环境变量里的代理被刻意忽略（见 notifyTransport），但有些环境里 IM 平台只有经代理
+// 才能到达（例如访问 Telegram）。这里提供一个**显式**配置的代理，仅用于 HTTP 渠道；
+// 邮件渠道（SMTP）始终直连。
+//
+// 走代理时拨号目标是代理本身——它是管理员明确填写的地址，而且经常就在本机
+// （127.0.0.1:7890 之类），所以这条链路上不挂拨号守卫；投递目标改为在发请求前
+// 检查（checkProxiedTarget）。
+var proxiedClient atomic.Pointer[http.Client]
+
+// SetProxy 设置（raw 非空）或清除（raw 为空）HTTP 渠道的代理。
+// 支持 http、https、socks5，可带账号密码。
+func SetProxy(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		proxiedClient.Store(nil)
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "socks5") {
+		return errors.New("通知代理必须是 http、https 或 socks5 地址")
+	}
+	transport := &http.Transport{}
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = t.Clone()
+	}
+	transport.Proxy = http.ProxyURL(u)
+	transport.DialContext = (&net.Dialer{Timeout: 10 * time.Second}).DialContext
+	proxiedClient.Store(&http.Client{Timeout: httpClient.Timeout, Transport: transport, CheckRedirect: checkNotifyRedirect})
+	return nil
+}
+
+// checkProxiedTarget 是走代理时对投递目标的检查，对应直连时的拨号守卫。
+//
+// 经代理后，目标主机名由代理去解析和连接，这里拦不到「连接建立的那一刻」，只能在
+// 发请求前判断：目标是 IP 字面量就直接判；是主机名就在本地解析一次，任一结果落在
+// 禁止的地址段即拒绝。本地解析失败不拦——需要代理的环境里，本地 DNS 对这些域名
+// 往往就是不可用的，目标交给代理解析。
+func checkProxiedTarget(ctx context.Context, target *url.URL) error {
+	if allowLocalTargets() {
+		return nil
+	}
+	host := target.Hostname()
+	blocked := func(ip net.IP) error {
+		if isBlockedDialIP(ip) {
+			return fmt.Errorf("拒绝投递到本机/链路本地地址 %s（如确需投递到本机服务，设置 %s=1）", ip, AllowLocalTargetsEnv)
 		}
 		return nil
-	},
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return blocked(ip)
+	}
+	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
+		return fmt.Errorf("拒绝投递到本机地址 %s（如确需投递到本机服务，设置 %s=1）", host, AllowLocalTargetsEnv)
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
+	if err != nil {
+		return nil
+	}
+	for _, a := range addrs {
+		if err := blocked(a.IP); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // respBodyLimit 限制读取响应体的大小。对端异常时可能吐回超大内容，而我们只需要
@@ -176,7 +249,15 @@ func doJSON(ctx context.Context, method, url string, headers map[string]string, 
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := httpClient.Do(req)
+	client := httpClient
+	if pc := proxiedClient.Load(); pc != nil {
+		if err := checkProxiedTarget(ctx, req.URL); err != nil {
+			// 与直连时被拨号守卫拦下的结果一致：按网络层失败上报，不带出完整地址。
+			return nil, fmt.Errorf("请求失败: %s", err)
+		}
+		client = pc
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		// 连接被拒、DNS 失败、超时——多为瞬时故障，交给退避重试。
 		//

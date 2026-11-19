@@ -328,14 +328,6 @@ func (m *Manager) Workers() int {
 	return n
 }
 
-// SetWorkers persists the concurrent work-agent count. Values <=0 are rejected.
-func (m *Manager) SetWorkers(n int) error {
-	if n <= 0 {
-		return fmt.Errorf("workers 必须 >0")
-	}
-	return m.pg.SetSetting(settingWorkers, strconv.Itoa(n))
-}
-
 // Enrich returns the asset auto-completion engine (may be nil if init failed).
 func (m *Manager) Enrich() *enrich.Engine { return m.enrich }
 
@@ -480,29 +472,11 @@ func (m *Manager) LLMRecordEnabled() bool {
 	return m.llmRecOn
 }
 
-// SetLLMRecordEnabled persists and applies the LLM-record toggle. Effective at
-// once — no applyLLM needed, since the recorder reads the flag on every call.
-func (m *Manager) SetLLMRecordEnabled(on bool) error {
-	if err := m.pg.SetBool(settingLLMRecord, on); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	m.llmRecOn = on
-	m.mu.Unlock()
-	return nil
-}
-
 // NoaCompactionEnabled reports whether the experimental noa context-compression
 // mechanism is on (默认关；settings.noa_compaction). Read per agent run via the
 // injected resolver, so a toggle takes effect on the next run without rebuild.
 func (m *Manager) NoaCompactionEnabled() bool {
 	return m.pg.GetBool(settingNoaCompaction, false)
-}
-
-// SetNoaCompaction persists the noa toggle. Effective on the next agent run —
-// the resolver reads it per run, so no rebuild is needed.
-func (m *Manager) SetNoaCompaction(on bool) error {
-	return m.pg.SetBool(settingNoaCompaction, on)
 }
 
 // LLMPoolEnabled reports whether LLM failover ("轮询") is on (默认关；
@@ -515,10 +489,6 @@ func (m *Manager) LLMPoolEnabled() bool {
 	return m.pg.GetBool(settingLLMPoolOn, false)
 }
 
-// SetLLMPoolEnabled persists the failover toggle. Callers rebuild agents
-// (applyLLM) afterwards so it takes effect.
-func (m *Manager) SetLLMPoolEnabled(on bool) error { return m.pg.SetBool(settingLLMPoolOn, on) }
-
 // LLMPoolBindFallback reports whether an agent/task that is BOUND to a specific
 // profile still falls back to the chain when that profile fails (默认关：绑定即
 // 独占，失败即失败). Only meaningful while LLMPoolEnabled.
@@ -527,12 +497,6 @@ func (m *Manager) LLMPoolBindFallback() bool {
 		return false
 	}
 	return m.pg.GetBool(settingLLMPoolBindFallback, false)
-}
-
-// SetLLMPoolBindFallback persists the bound-profile fallback toggle. Callers
-// rebuild agents (applyLLM) afterwards.
-func (m *Manager) SetLLMPoolBindFallback(on bool) error {
-	return m.pg.SetBool(settingLLMPoolBindFallback, on)
 }
 
 // normalizeWebSearchBackend canonicalizes a backend name: trimmed, lower-cased,
@@ -563,6 +527,17 @@ func (m *Manager) WebSearch() (on bool, backend, braveKey, tavilyKey, proxy stri
 // into each agent. Disabled when off, or when a keyed backend is selected without
 // its key (so a half-configured backend never silently drops the tool at session build).
 func (m *Manager) WebSearchOpts() agent.WebSearchOpts {
+	o := m.webSearchBaseOpts()
+	if o.Backend == deepSeekWebSearchBackend {
+		o.DeepSeekBaseURL, o.DeepSeekAPIKey, o.DeepSeekModel, o.DeepSeekUserAgent = m.deepSeekSearchCreds()
+	}
+	return o
+}
+
+// webSearchBaseOpts is WebSearchOpts without the DeepSeek credentials. Those
+// come from the active profile — a database read — which callers that lend the
+// credentials of the profile they run on can skip (see Server.webSearchForCfg).
+func (m *Manager) webSearchBaseOpts() agent.WebSearchOpts {
 	on, backend, braveKey, tavilyKey, proxy := m.WebSearch()
 	if on && backend == "brave-free" && strings.TrimSpace(braveKey) == "" {
 		on = false
@@ -570,11 +545,7 @@ func (m *Manager) WebSearchOpts() agent.WebSearchOpts {
 	if on && backend == "tavily" && strings.TrimSpace(tavilyKey) == "" {
 		on = false
 	}
-	o := agent.WebSearchOpts{Enabled: on, Backend: backend, BraveKey: braveKey, TavilyKey: tavilyKey, Proxy: proxy}
-	if backend == deepSeekWebSearchBackend {
-		o.DeepSeekBaseURL, o.DeepSeekAPIKey, o.DeepSeekModel, o.DeepSeekUserAgent = m.deepSeekSearchCreds()
-	}
-	return o
+	return agent.WebSearchOpts{Enabled: on, Backend: backend, BraveKey: braveKey, TavilyKey: tavilyKey, Proxy: proxy}
 }
 
 // deepSeekSearchCreds resolves the credentials the "deepseek" search backend
@@ -590,50 +561,6 @@ func (m *Manager) deepSeekSearchCreds() (baseURL, apiKey, model, userAgent strin
 		return "", "", "", ""
 	}
 	return p.BaseURL, p.APIKey, p.Model, p.UserAgent
-}
-
-// SetWebSearch persists and applies the web-search settings. braveKey, tavilyKey, and
-// proxy are each left untouched when nil (so toggling the switch doesn't wipe a saved
-// key/proxy; pass a pointer to "" to clear). Callers must rebuild agents (applyLLM)
-// afterwards so the settings take effect.
-func (m *Manager) SetWebSearch(on bool, backend string, braveKey, tavilyKey, proxy *string) error {
-	backend = normalizeWebSearchBackend(backend)
-	if err := m.pg.SetBool(settingWebSearchOn, on); err != nil {
-		return err
-	}
-	if err := m.pg.SetSetting(settingWebSearchBackend, backend); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	m.webSearchOn = on
-	m.webSearchBackend = backend
-	m.mu.Unlock()
-	if braveKey != nil {
-		if err := m.pg.SetSetting(settingBraveKey, *braveKey); err != nil {
-			return err
-		}
-		m.mu.Lock()
-		m.braveKey = *braveKey
-		m.mu.Unlock()
-	}
-	if tavilyKey != nil {
-		if err := m.pg.SetSetting(settingTavilyKey, *tavilyKey); err != nil {
-			return err
-		}
-		m.mu.Lock()
-		m.tavilyKey = *tavilyKey
-		m.mu.Unlock()
-	}
-	if proxy != nil {
-		p := strings.TrimSpace(*proxy)
-		if err := m.pg.SetSetting(settingWebSearchProxy, p); err != nil {
-			return err
-		}
-		m.mu.Lock()
-		m.webSearchProxy = p
-		m.mu.Unlock()
-	}
-	return nil
 }
 
 // browserMCPName is the seeded Playwright MCP whose proxy args + CA env are kept
@@ -779,33 +706,6 @@ func (m *Manager) GlobalProxy() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.globalProxy
-}
-
-// SetGlobalProxy validates, persists and applies the global egress proxy
-// (http/https/socks5, optional user:pass; empty = direct). It updates the MITM's
-// upstream immediately; callers must rebuild agents (applyLLM) afterwards so the
-// capture-off path (bash env / WebFetch) picks up the change too.
-func (m *Manager) SetGlobalProxy(raw string) error {
-	raw = strings.TrimSpace(raw)
-	if raw != "" {
-		if _, err := traffic.ValidateProxyURL(raw); err != nil {
-			return err
-		}
-	}
-	if err := m.pg.SetSetting(settingGlobalProxy, raw); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	m.globalProxy = raw
-	m.mu.Unlock()
-	if m.traffic != nil {
-		if err := m.traffic.SetUpstreamProxy(raw); err != nil {
-			return err
-		}
-	}
-	// Keep the browser MCP's egress in sync with the new global proxy too.
-	m.syncBrowserMCPProxy()
-	return nil
 }
 
 func (m *Manager) Close() error {

@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -219,5 +221,71 @@ func TestAuthRoutesCapRequestBody(t *testing.T) {
 	var tooLarge *http.MaxBytesError
 	if !errors.As(readErr, &tooLarge) {
 		t.Fatalf("oversized unauthenticated body read without a cap: err=%v", readErr)
+	}
+}
+
+// The legacy jwt.key lived in the browsable workspace, where the file manager
+// could serve it. It must be retired — removed, and never reused as the signing
+// key — not migrated: whoever downloaded it could otherwise keep minting tokens.
+func TestLegacyWorkspaceJWTKeyIsRetiredNotMigrated(t *testing.T) {
+	keyDir, dataDir := t.TempDir(), t.TempDir()
+	leaked := strings.Repeat("L", 40)
+	legacy := filepath.Join(dataDir, jwtKeyFilename)
+	if err := os.WriteFile(legacy, []byte(leaked), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	key, err := loadOrCreateJWTKey(keyDir, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(key) == leaked {
+		t.Fatal("the workspace key was reused as the signing key")
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("legacy key left in the workspace: %v", err)
+	}
+	again, err := loadOrCreateJWTKey(keyDir, dataDir)
+	if err != nil || string(again) != string(key) {
+		t.Fatalf("the new key is not stable across loads: err=%v", err)
+	}
+}
+
+// An event stream authenticates once and stays open for hours. It must end once
+// its token stops being valid; a normal API request is not watched.
+func TestOpenEventStreamEndsWhenItsTokenStopsBeingValid(t *testing.T) {
+	old := streamRecheckInterval
+	streamRecheckInterval = 20 * time.Millisecond
+	defer func() { streamRecheckInterval = old }()
+
+	s := &Server{jwtKey: []byte("stream-revocation-test-key-0123456789")}
+	shortLived, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+		Subject:   "ARTEX",
+		IssuedAt:  jwt.NewNumericDate(time.Now()),
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(2500 * time.Millisecond)),
+	}).SignedString(s.jwtKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ended := make(chan struct{})
+	h := s.requireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done() // a stream handler: runs until its context ends
+		close(ended)
+	}))
+	req := httptest.NewRequest("GET", "/api/logs/stream?token="+shortLived, nil)
+	req.Header.Set("Accept", "text/event-stream")
+	go h.ServeHTTP(httptest.NewRecorder(), req)
+	select {
+	case <-ended:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stream outlived its token")
+	}
+
+	if isEventStream(httptest.NewRequest("GET", "/api/tasks", nil)) {
+		t.Fatal("a plain API request was treated as an event stream")
+	}
+	post := httptest.NewRequest("POST", "/api/x", nil)
+	post.Header.Set("Accept", "text/event-stream")
+	if isEventStream(post) {
+		t.Fatal("a POST was treated as an event stream")
 	}
 }

@@ -50,6 +50,7 @@ export default function NotifyPage() {
   const [globalSaving, setGlobalSaving] = React.useState(false);
   const [baseURL, setBaseURL] = React.useState("");
   const [digestMin, setDigestMin] = React.useState("");
+  const [notifyProxy, setNotifyProxy] = React.useState("");
 
   const load = React.useCallback(() => {
     api
@@ -58,6 +59,7 @@ export default function NotifyPage() {
         setMeta(m);
         setBaseURL(m.public_base_url);
         setDigestMin(m.digest_interval_min);
+        setNotifyProxy(m.proxy ?? "");
       })
       .catch((e) => toast.error("读取推送配置失败：" + (e as Error).message));
     // 渠道列表加载失败要报出来：静默失败会显示成「一个渠道都没有」，
@@ -246,7 +248,10 @@ export default function NotifyPage() {
   async function saveGlobal() {
     setGlobalSaving(true);
     try {
-      const patch: Record<string, unknown> = { notify_public_base_url: baseURL.trim() };
+      const patch: Record<string, unknown> = {
+        notify_public_base_url: baseURL.trim(),
+        notify_proxy: notifyProxy.trim(),
+      };
       const n = Number(digestMin);
       if (Number.isFinite(n) && n > 0) patch.notify_digest_interval_min = n;
       await api.setSettings(patch);
@@ -330,6 +335,22 @@ export default function NotifyPage() {
               onChange={(e) => setDigestMin(e.target.value)}
             />
             <p className="text-muted-foreground text-xs">仅对「汇总」模式的渠道生效。</p>
+          </div>
+          <div className="grid gap-2 sm:col-span-2">
+            <Label htmlFor="n-proxy">推送代理（可选）</Label>
+            <Input
+              id="n-proxy"
+              className="font-mono"
+              autoComplete="off"
+              placeholder="http://127.0.0.1:7890 或 socks5://user:pass@host:1080（留空=直连）"
+              value={notifyProxy}
+              onChange={(e) => setNotifyProxy(e.target.value)}
+            />
+            <p className="text-muted-foreground text-xs">
+              仅当 IM 平台必须经代理才能访问时填写（如 Telegram）。只对 Webhook
+              类渠道生效，邮件始终直连；系统环境变量里的 HTTP(S)_PROXY 对推送不生效。已保存的代理密码显示为
+              __masked__，保持不动即沿用原密码。
+            </p>
           </div>
           <div className="sm:col-span-2">
             <Button onClick={saveGlobal} disabled={globalSaving}>

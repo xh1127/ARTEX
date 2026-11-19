@@ -592,6 +592,7 @@ function ProfileSheet({
             <p className="text-muted-foreground text-xs">
               仅 LLM 出站请求走此代理，支持 http/https/socks5，可带账号密码（如
               socks5://user:pass@host:port，密码含特殊字符需 URL 编码）；留空表示不使用代理（直连）。
+              已保存的代理密码显示为 __masked__，保持不动即沿用原密码；改了代理地址需重新填写密码。
             </p>
           </div>
 

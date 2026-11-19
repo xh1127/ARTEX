@@ -524,7 +524,7 @@ func TestSettingsRejectInvalidPatchWithoutChanges(t *testing.T) {
 func TestSettingsCommitPatchAndRebuildPool(t *testing.T) {
 	s, _ := newProfileRuntimeTestServer(t)
 	preserveRuntimeSettings(t, s, settingLLMPoolOn, settingLLMRecord, settingWebSearchOn, settingWebSearchBackend, settingBraveKey)
-	if err := s.m.SetLLMPoolEnabled(false); err != nil {
+	if err := s.m.pg.SetBool(settingLLMPoolOn, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.reapplyActiveProfile(); err != nil {

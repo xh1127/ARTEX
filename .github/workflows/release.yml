@@ -11,8 +11,8 @@ jobs:
   frontend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: "22"
           cache: npm
@@ -21,7 +21,7 @@ jobs:
         working-directory: web
       - run: npm run build:static
         working-directory: web
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: web-dist
           path: web/out
@@ -39,16 +39,16 @@ jobs:
           - { goos: darwin, goarch: arm64 }
           - { goos: windows, goarch: amd64 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Read the toolchain from go.mod instead of a floating "1.26": a bare minor
       # range can resolve below the required patch release, which makes Go fetch
       # a second toolchain mid-build (GOTOOLCHAIN=auto) during a CGO-free cross
       # compile — exactly where a slow download turns into a flaky job.
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: web-dist
           path: server/webui/dist
@@ -69,13 +69,13 @@ jobs:
       - name: Smoke test Linux amd64 binary
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: dist/artex-linux-amd64/artex -h
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: pkg-${{ matrix.goos }}-${{ matrix.goarch }}
           path: "dist/*.zip"
       # Linux 生二进制单独上传，供 docker job 复用（免在镜像里重编前端+Go）
       - if: matrix.goos == 'linux'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: bin-linux-${{ matrix.goarch }}
           path: dist/artex-linux-${{ matrix.goarch }}/artex
@@ -85,7 +85,7 @@ jobs:
     needs: binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: pkg-*
           merge-multiple: true
@@ -106,12 +106,12 @@ jobs:
     needs: binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4 # 取 Dockerfile 与 skills/
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5 # 取 Dockerfile 与 skills/
+      - uses: actions/download-artifact@v7
         with:
           name: bin-linux-amd64
           path: dist/amd64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: bin-linux-arm64
           path: dist/arm64

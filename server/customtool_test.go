@@ -88,6 +88,11 @@ func TestExecPython(t *testing.T) {
 	if err != nil {
 		t.Skip("python3 unavailable")
 	}
+	// On Windows, python3 often resolves to the Microsoft Store "app execution
+	// alias" — a stub that exists on PATH but runs no Python. Require a real one.
+	if out, err := exec.Command(interp, "-c", "print(6*7)").Output(); err != nil || strings.TrimSpace(string(out)) != "42" {
+		t.Skipf("python3 at %s is not a working interpreter (%v)", interp, err)
+	}
 	code := `import json,sys,os
 a = json.load(sys.stdin)
 print("stdin_target=" + a["target"])

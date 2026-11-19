@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"log"
@@ -52,20 +53,18 @@ func validatePassword(pw string) string {
 // loadOrCreateJWTKey reads the 32-byte signing key from keyDir/jwt.key. keyDir is
 // the project base dir (next to the executable), NOT the browsable workspace root
 // (dataDir) — the signing key must never be listable/downloadable via the file
-// manager. Legacy installs kept it at dataDir/jwt.key; if present there and not yet
-// at the new location, it is migrated (key preserved, so sessions stay valid) and
-// the old file removed so it disappears from the workspace. On first run a random
-// key is generated and persisted.
+// manager. Legacy installs kept it at dataDir/jwt.key, where the file manager
+// could serve it. That key is retired, not migrated: anyone who downloaded it
+// could otherwise keep minting admin tokens. The legacy file is removed and a
+// fresh key generated (existing sessions log in again once).
 func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
 	path := filepath.Join(keyDir, jwtKeyFilename)
-	// one-time migration out of the old in-workspace location.
 	if legacy := filepath.Join(dataDir, jwtKeyFilename); legacy != path {
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			if data, rerr := os.ReadFile(legacy); rerr == nil {
-				if werr := os.WriteFile(path, data, 0o600); werr == nil {
-					_ = os.Remove(legacy)
-					log.Printf("[auth] JWT key 已从 %s 迁移到 %s（移出可浏览工作区）", legacy, path)
-				}
+		if _, err := os.Stat(legacy); err == nil {
+			if rerr := os.Remove(legacy); rerr != nil {
+				log.Printf("[auth] 无法删除旧位置的 JWT key %s（它曾可经文件管理器下载，请手动删除）: %v", legacy, rerr)
+			} else {
+				log.Printf("[auth] 已删除工作区内的旧 JWT key %s（曾可经文件管理器下载，不再沿用）", legacy)
 			}
 		}
 	}
@@ -234,8 +233,47 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			writeErr(w, 401, "token 无效或已过期")
 			return
 		}
+		if isEventStream(r) {
+			// A stream authenticates once and then lives for hours. Re-validate
+			// its token while it is open, so a password change (which revokes
+			// every earlier token) or the token's own expiry also ends streams
+			// that were already connected.
+			ctx, cancel := context.WithCancel(r.Context())
+			defer cancel()
+			go s.watchStreamToken(ctx, cancel, tok)
+			r = r.WithContext(ctx)
+		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// streamRecheckInterval is how often an open event stream re-validates its token.
+// A var so tests can shorten it.
+var streamRecheckInterval = 15 * time.Second
+
+// isEventStream reports whether r opens a Server-Sent Events stream (EventSource
+// always sends this Accept header).
+func isEventStream(r *http.Request) bool {
+	return r.Method == http.MethodGet && strings.Contains(r.Header.Get("Accept"), "text/event-stream")
+}
+
+// watchStreamToken cancels a stream once its token stops being valid. Only a
+// definite "invalid" ends it: an unreadable password epoch (database blip) must
+// not drop every live stream.
+func (s *Server) watchStreamToken(ctx context.Context, cancel context.CancelFunc, tok string) {
+	t := time.NewTicker(streamRecheckInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if s.checkToken(tok) == tokenInvalid {
+				cancel()
+				return
+			}
+		}
+	}
 }
 
 // GET /api/auth/status — reports whether the admin password has been initialised.
@@ -283,7 +321,11 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Checked before bcrypt so an unauthenticated caller can't make us burn CPU.
+	if s.throttled(w, r) {
+		return
+	}
 	if !s.setup.matches(req.SetupToken) {
+		s.loginLimit.fail(clientKey(r))
 		writeErr(w, 403, "初始化令牌不正确：请查看服务启动日志，或程序目录下的 setup-token 文件")
 		return
 	}
@@ -309,6 +351,7 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setup.retire()
+	s.loginLimit.succeed(clientKey(r))
 	s.forgetPasswordEpoch()
 	tok, err := signJWT(s.jwtKey)
 	if err != nil {
@@ -360,10 +403,15 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码未初始化，请先设置密码")
 		return
 	}
+	if s.throttled(w, r) {
+		return
+	}
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.OldPassword)); err != nil {
+		s.loginLimit.fail(clientKey(r))
 		writeErr(w, 401, "当前密码错误")
 		return
 	}
+	s.loginLimit.succeed(clientKey(r))
 	newHash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
 	if err != nil {
 		writeErr(w, 500, "密码加密失败")
@@ -398,7 +446,12 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "请求格式错误")
 		return
 	}
+	if s.throttled(w, r) {
+		return
+	}
+	key := clientKey(r)
 	if req.Username != "ARTEX" {
+		s.loginLimit.fail(key)
 		writeErr(w, 401, "用户名或密码错误")
 		return
 	}
@@ -412,9 +465,11 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
+		s.loginLimit.fail(key)
 		writeErr(w, 401, "用户名或密码错误")
 		return
 	}
+	s.loginLimit.succeed(key)
 	tok, err := signJWT(s.jwtKey)
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")

@@ -581,7 +581,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 			if !ok {
 				return s.webSearchFor("worker")
 			}
-			return mergeSearchCreds(s.webSearchFor("worker"), cfg)
+			return s.webSearchForCfg("worker", cfg)
 		})
 	}
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
@@ -601,7 +601,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 			if !ok {
 				return s.webSearchFor("planner")
 			}
-			return mergeSearchCreds(s.webSearchFor("planner"), cfg)
+			return s.webSearchForCfg("planner", cfg)
 		})
 	}
 	pl.SetConstraintInject(s.constraintInjectPlanner) // 操作约束注入 planner(可配置,默认开)
@@ -623,7 +623,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 			if !ok {
 				return s.webSearchFor("mainagent")
 			}
-			return mergeSearchCreds(s.webSearchFor("mainagent"), cfg)
+			return s.webSearchForCfg("mainagent", cfg)
 		})
 	}
 	main.SetSteerWork(s.engine.SteerWork) // steer_work：人对运行中 work 实时纠偏

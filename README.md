@@ -255,6 +255,8 @@ server {
 }
 ```
 
+> **访问日志**：实时活动流（SSE）用浏览器的 EventSource 建立，它不能带请求头，登录 token 因此放在 URL 的 `?token=` 里。反代的访问日志若记录完整请求行，token 会落进日志文件——建议让日志只记路径（Nginx 的 `log_format` 用 `$uri` 而不是 `$request`），或限制日志文件的读取权限。修改密码会让此前的 token 全部失效。
+
 > 仅当 SSE 需要走与页面不同的来源（如独立子域）时，才在**构建期**设置 `NEXT_PUBLIC_SSE_BASE`（该变量在 `next build` 时固化进静态包，容器运行时再设无效）。
 
 ---

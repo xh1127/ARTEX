@@ -946,6 +946,7 @@ export interface Settings {
   // ---- 漏洞 IM 推送（渠道本身是独立资源，见 /api/notify/*，这里只有三项全局配置）----
   notify_enabled?: boolean; // 推送总开关，默认开；用于维护期一键止血
   notify_public_base_url?: string; // 漏洞详情回链的外部访问地址；空=消息不带回链
+  notify_proxy?: string; // HTTP 推送渠道的代理（http/https/socks5）；空=直连；密码回显为掩码
   notify_digest_interval_min?: number; // 汇总模式周期（分钟），默认 30
 }
 
@@ -991,6 +992,7 @@ export interface NotificationMeta {
   kinds: NotificationKind[];
   enabled: boolean;
   public_base_url: string;
+  proxy?: string; // HTTP 推送渠道的代理；密码回显为掩码
   digest_interval_min: string;
   defaults: { digest_interval_min: number };
   stats: {
