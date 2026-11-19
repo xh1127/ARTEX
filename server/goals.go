@@ -44,6 +44,27 @@ func (s *Server) startTaskEngine(t *Task) {
 	if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
 		return
 	}
+	// Claimed once per process with the planner's goalless round: a resume can
+	// wake loops restored earlier before this goroutine runs, and both reaching
+	// decomposition would create every goal twice. If the planner got there
+	// first, just make sure the loops run.
+	if s.engine.beginGoalBootstrap(t.ID) {
+		s.decomposeGoals(ctx, t)
+		if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
+			s.engine.abortGoalBootstrap(t.ID) // cut short: the resume decomposes again
+			return
+		}
+		s.engine.endGoalBootstrap(t.ID)
+	}
+	if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
+		return
+	}
+	s.engine.Run(s.ctx, t)
+}
+
+// decomposeGoals runs the visible "round 0" goal decomposition: the round marker,
+// the LLM decomposition (or its raw-goal fallback), then one line per goal.
+func (s *Server) decomposeGoals(ctx context.Context, t *Task) {
 	s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
 		Summary: "第 0 轮目标拆解"})
 	goals := s.createGoals(ctx, t, func(r db.Activity) {
@@ -59,10 +80,6 @@ func (s *Server) startTaskEngine(t *Task) {
 		}
 		s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "text", Summary: summary})
 	}
-	if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
-		return
-	}
-	s.engine.Run(s.ctx, t)
 }
 
 func (s *Server) occupiesConcurrencySlot(t *Task) bool {

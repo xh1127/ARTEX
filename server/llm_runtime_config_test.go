@@ -572,6 +572,9 @@ func TestLLMBuildFailureReasonIsReported(t *testing.T) {
 	if _, err := s.m.pg.Exec(`UPDATE llm_profiles SET proxy='ftp://invalid.example' WHERE id=$1`, activeID); err != nil {
 		t.Fatal(err)
 	}
+	// Edited behind the handlers' back: drop the provider cache the way every
+	// save handler does, or applyLLM reuses the provider built from the old row.
+	s.invalidateProfileAgents()
 	if err := s.reapplyActiveProfile(); err == nil {
 		t.Fatal("an invalid active profile was applied")
 	}
@@ -581,6 +584,7 @@ func TestLLMBuildFailureReasonIsReported(t *testing.T) {
 	if _, err := s.m.pg.Exec(`UPDATE llm_profiles SET proxy=NULL WHERE id=$1`, activeID); err != nil {
 		t.Fatal(err)
 	}
+	s.invalidateProfileAgents()
 	if err := s.reapplyActiveProfile(); err != nil {
 		t.Fatal(err)
 	}

@@ -173,6 +173,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.initSideQuestions()
+	// Goals never decomposed (a restart mid launchTask) are decomposed by the
+	// planner's first round instead of the task being read as "all goals met".
+	s.engine.SetGoalBootstrap(s.decomposeGoals)
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
 	s.applyRetryPolicy()
@@ -306,27 +309,14 @@ func (s *Server) restoreTaskRuntimes() {
 	// only the active UI task left other non-queued tasks counted as concurrency
 	// occupants without live loops, which could permanently block the persistent
 	// FIFO. Paused loops remain idle; queued tasks are admitted below as slots allow.
+	// A task restarted mid goal-decomposition is handled by the planner itself: a
+	// round that finds no goal node at all decomposes instead of finishing (see
+	// Engine.SetGoalBootstrap).
 	for _, t := range m.List() {
 		lifecycle := t.lifecycleSnapshot()
-		if lifecycle.Queued || isTerminalStatus(lifecycle.Status) {
-			continue
+		if !lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
+			s.engine.Run(s.ctx, t)
 		}
-		// A task admitted but interrupted during goal decomposition (restart,
-		// self-update, crash) has never run and has no goal nodes. Starting its
-		// loops directly would send the planner down the goalless branch, which
-		// reads "no open goal, no active intent" as finished and marks the task
-		// done without it ever running. Redo the bootstrap instead: decompose
-		// goals first, then start the engine — the same order launchTask uses.
-		if s.resumeAdmissionMode(t) == "bootstrap" {
-			// A paused one must not get loops either: the resume path
-			// (admitPausedTask) bootstraps it, and loops started here would be
-			// woken by that resume before its goals exist.
-			if !lifecycle.Paused {
-				s.startAdmittedTask(t, "bootstrap")
-			}
-			continue
-		}
-		s.engine.Run(s.ctx, t)
 	}
 }
 

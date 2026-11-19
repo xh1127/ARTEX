@@ -151,6 +151,41 @@ type Engine struct {
 	// readiness reports whether a global LLM provider is configured — the signal behind
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness func() bool
+
+	// goalBootstrap decomposes a task's goals (wired by the server). It runs at most
+	// once per task per process, claimed through goalBootstrapState by whichever
+	// path gets there first: launchTask's startTaskEngine, or a planner round that
+	// finds the task has no goal node at all (see the goalless branch).
+	goalBootstrap      func(ctx context.Context, t *Task)
+	goalBootstrapState sync.Map // taskID -> goalBootstrapRunning | goalBootstrapDone
+}
+
+const (
+	goalBootstrapRunning = 1
+	goalBootstrapDone    = 2
+)
+
+// SetGoalBootstrap wires goal decomposition for tasks whose goals were never
+// decomposed. Called once at startup.
+func (e *Engine) SetGoalBootstrap(fn func(ctx context.Context, t *Task)) { e.goalBootstrap = fn }
+
+// beginGoalBootstrap claims this process's one decomposition of t's goals.
+// false = another path is running it or already ran it.
+func (e *Engine) beginGoalBootstrap(taskID string) bool {
+	_, loaded := e.goalBootstrapState.LoadOrStore(taskID, goalBootstrapRunning)
+	return !loaded
+}
+
+// endGoalBootstrap records a finished decomposition. A decomposition cut short by
+// pause/delete is released instead (abortGoalBootstrap) so the resume retries it.
+func (e *Engine) endGoalBootstrap(taskID string) {
+	e.goalBootstrapState.Store(taskID, goalBootstrapDone)
+}
+func (e *Engine) abortGoalBootstrap(taskID string) { e.goalBootstrapState.Delete(taskID) }
+
+func (e *Engine) goalBootstrapRunning(taskID string) bool {
+	v, ok := e.goalBootstrapState.Load(taskID)
+	return ok && v == goalBootstrapRunning
 }
 
 type taskRuntime struct {
@@ -848,6 +883,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// 不是跑完了）；意图已全部跑干 → 落 done。
 		// 整段纯 Go、不触发任何 LLM 调用，也不打规划轮 marker。
 		if open, err := t.Store.HasOpenGoal(); err == nil && !open {
+			if e.bootstrapGoalsIfNeverDecomposed(ctx, t) {
+				return
+			}
 			t.drainTriggers() // 丢弃累积的 done/finding 触发，避免 goalless 长会话里无界增长
 			if active, err := t.Store.HasPendingIntent(); err == nil && !active {
 				// frontier 抽干且无在跑意图 → 收尾。用 Guarded 版做 CAS，避免踩到并发的
@@ -926,6 +964,41 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// 每次唤醒(边沿或心跳)后重臂心跳:任意规划触发都重算这段静置计时。
 		resetPlannerTimer(heartbeat, interval)
 	}
+}
+
+// bootstrapGoalsIfNeverDecomposed handles a goalless round for a task that has no
+// goal node in any state. That means its goals were never decomposed — typically
+// the process restarted while launchTask was decomposing them — not that they
+// were all met; finishing it here marked a task done that never ran. It reports
+// true when the round must end without the goalless "drained → done" logic:
+// it decomposed now (the next round plans against the new goals), or another
+// path is mid-decomposition. Once decomposition finished in this process and a
+// task still has no goal (an empty task goal), it is genuinely goalless → false.
+func (e *Engine) bootstrapGoalsIfNeverDecomposed(ctx context.Context, t *Task) bool {
+	if e.goalBootstrap == nil {
+		return false
+	}
+	goals, err := t.Store.ListByKind(db.KindGoal, 1)
+	if err != nil || len(goals) > 0 {
+		return err != nil // unreadable: don't risk finishing the task this round
+	}
+	if !e.beginGoalBootstrap(t.ID) {
+		return e.goalBootstrapRunning(t.ID) // running elsewhere: its Run/Notify follows
+	}
+	if !e.beginTaskOperation(t.ID) { // deleting
+		e.abortGoalBootstrap(t.ID)
+		return true
+	}
+	ectx := e.execContextFor(ctx, t.ID) // cancellable by pause, like a planning round
+	e.goalBootstrap(ectx, t)
+	e.decInflight(t.ID)
+	if ectx.Err() != nil {
+		e.abortGoalBootstrap(t.ID) // cut short: let the resume decompose again
+		return true
+	}
+	e.endGoalBootstrap(t.ID)
+	t.Notify() // plan against the goals just created
+	return true
 }
 
 func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {

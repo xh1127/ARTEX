@@ -514,12 +514,18 @@ func (c *Client) roundTrip(ctx context.Context, body rpcRequest, expectResp bool
 // only acknowledges receipt; the JSON-RPC response arrives on the SSE stream.
 func (c *Client) legacyRoundTrip(ctx context.Context, body rpcRequest, expectResp bool) (*rpcResponse, error) {
 	// Serializing calls keeps the first implementation deterministic while the
-	// shared SSE reader still handles asynchronous delivery.
+	// shared SSE reader still handles asynchronous delivery. Only a call that
+	// waits for a response needs the stream, so only it fails fast once the
+	// stream is gone; a notification is just a POST (a nil channel never fires).
+	var streamGone <-chan struct{}
+	if expectResp {
+		streamGone = c.streamDone
+	}
 	select {
 	case c.legacySem <- struct{}{}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-c.streamDone:
+	case <-streamGone:
 		return nil, c.streamClosedErr()
 	}
 	defer func() { <-c.legacySem }()
