@@ -53,7 +53,26 @@ func isBlockedDialIP(ip net.IP) bool {
 		ip = v4
 	}
 	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
+		ip.IsInterfaceLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() ||
+		isCloudMetadataIP(ip)
+}
+
+// cloudMetadataIPs 是落在上面几类地址段**之外**的云元数据端点（169.254.169.254
+// 已被链路本地覆盖）。按精确地址拦，而不是整段拦：CGNAT / ULA 网段里也有合法的内网
+// 服务，而这几个地址绝不会是 IM 机器人或邮件服务器。
+var cloudMetadataIPs = []net.IP{
+	net.ParseIP("100.100.100.200"), // 阿里云 ECS 元数据（CGNAT 段）
+	net.ParseIP("fd00:ec2::254"),   // AWS IMDS 的 IPv6 端点（ULA 段）
+	net.ParseIP("168.63.129.16"),   // Azure WireServer（平台通信端点）
+}
+
+func isCloudMetadataIP(ip net.IP) bool {
+	for _, m := range cloudMetadataIPs {
+		if m.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // blockInternalDial 是 http.Transport 拨号器的 Control 钩子，在**连接建立时**
@@ -81,15 +100,21 @@ func blockInternalDial(_, address string, _ syscall.RawConn) error {
 	return nil
 }
 
-// notifyTransport 在默认 Transport 的基础上只加一个拨号守卫。
-// 用 Clone 保留默认的全部调优（连接池、HTTP/2、超时、proxy 等），
-// 避免为了加一个检查而改动其它行为。
+// notifyTransport 在默认 Transport 的基础上加一个拨号守卫，并且**不走代理**。
+// 用 Clone 保留默认的连接池、HTTP/2、超时等调优。
+//
+// Proxy 必须置空：Clone 会带上 ProxyFromEnvironment，而拨号守卫只能看到「实际拨号
+// 的地址」。一旦设置了 HTTP(S)_PROXY，拨的就是代理而不是投递目标——代理在本机
+// （127.0.0.1:7890 这类常见配置）时所有投递都被当成「投递到本机」拒掉；代理在别处
+// 时守卫看不到真正的目标，指向 169.254.169.254 的地址就绕过去了。与项目其它出口
+// 一致：不回退环境变量里的代理（见下方 httpClient 的说明）。
 var notifyTransport = func() *http.Transport {
 	t, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
-		return &http.Transport{}
+		return &http.Transport{DialContext: (&net.Dialer{Timeout: 10 * time.Second, Control: blockInternalDial}).DialContext}
 	}
 	clone := t.Clone()
+	clone.Proxy = nil
 	clone.DialContext = (&net.Dialer{Timeout: 10 * time.Second, Control: blockInternalDial}).DialContext
 	return clone
 }()

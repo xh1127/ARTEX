@@ -1134,6 +1134,7 @@ export default function DashboardPage() {
               <div className="text-[10px] text-muted-foreground">LLM 配置</div>
               <Badge
                 variant="outline"
+                title={!stats?.llm_configured && stats?.llm_error ? stats.llm_error : undefined}
                 className={cn(
                   "text-[10px]",
                   stats?.llm_configured
@@ -1141,7 +1142,7 @@ export default function DashboardPage() {
                     : "border-red-500/30 bg-red-500/10 text-red-400",
                 )}
               >
-                {stats?.llm_configured ? "已配置" : "未配置"}
+                {stats?.llm_configured ? "已配置" : stats?.llm_error ? "配置无效" : "未配置"}
               </Badge>
             </div>
 

@@ -44,6 +44,12 @@ trap forward INT TERM
 
 delay=1
 while :; do
+	# A stop that arrived between runs (during the crash backoff below) must not
+	# relaunch artex: the trap only sets the flag, there was no child to signal.
+	if [ "$stopping" -eq 1 ]; then
+		echo "[artex] 已停止"
+		exit 0
+	fi
 	"$BIN" "$@" &
 	child=$!
 
@@ -74,7 +80,14 @@ while :; do
 			;;
 		*)
 			echo "[artex] 异常退出 (code=$code)，${delay}s 后重启" >&2
-			sleep "$delay"
+			# Sleep in the background and wait for it: sh runs a trap only after the
+			# foreground command finishes, so a foreground sleep held a stop request
+			# for up to MAX_DELAY seconds — longer than docker stop's grace period.
+			# wait, unlike sleep, returns as soon as the trap fires.
+			sleep "$delay" &
+			sleeper=$!
+			wait "$sleeper" 2>/dev/null
+			kill "$sleeper" 2>/dev/null || true
 			delay=$((delay * 2))
 			[ "$delay" -gt "$MAX_DELAY" ] && delay=$MAX_DELAY
 			;;

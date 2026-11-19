@@ -3,10 +3,12 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
@@ -163,6 +165,33 @@ func intentSummaryOf(n *db.Node) string {
 	return ""
 }
 
+// Retry budget for deleting an intent that a worker claims concurrently: ~1s,
+// far longer than the claim → work-registration gap it has to span.
+const (
+	intentDeleteRetries    = 20
+	intentDeleteRetryDelay = 50 * time.Millisecond
+)
+
+// deleteIntentRow performs the soft (state='deleted') or hard (physical,
+// cascading to exclusively-owned descendants) delete. Both refuse a running
+// intent with db.ErrIntentStateConflict.
+func deleteIntentRow(t *Task, iid int64, mode, reason string, out *intentControlResult) error {
+	if mode == "hard" {
+		cleanup, err := t.Store.CancelIntent(iid)
+		if err != nil {
+			return err
+		}
+		out.Deleted = &cleanup
+		out.State = "" // 节点已删除,前端据 Deleted 从列表移除
+		return nil
+	}
+	if _, err := t.Store.SoftDeleteIntent(iid, reason); err != nil {
+		return err
+	}
+	out.State = db.StateIntentDeleted
+	return nil
+}
+
 func (s *Server) applyIntentControl(ctx context.Context, t *Task, iid int64, action, reason, mode string) (intentControlResult, error) {
 	out := intentControlResult{ID: iid}
 	node, err := t.Store.GetNode(iid)
@@ -214,29 +243,42 @@ func (s *Server) applyIntentControl(ctx context.Context, t *Task, iid int64, act
 		if reason == "" {
 			return out, fmt.Errorf("请填写删除原因")
 		}
-		if node.State == "running" {
-			if err := s.engine.ControlWork(ctx, iid, "cancel"); err != nil {
-				return out, err
-			}
-		}
 		summary := intentSummaryOf(node)
-		if mode == "hard" {
-			cleanup, err := t.Store.CancelIntent(iid)
-			if err != nil {
+		// node.State was read before any lock and can be stale: a worker may claim
+		// an open intent right now. The delete itself refuses a running intent
+		// (checked under the row lock), so on that conflict re-read, stop the work
+		// that just started, and try again — a deleted intent must never keep
+		// executing. A just-claimed intent registers its work a moment after the
+		// claim; the short retry spans that gap.
+		for attempt := 0; ; attempt++ {
+			if node.State == "running" {
+				if err := s.engine.ControlWork(ctx, iid, "cancel"); err != nil && !errors.Is(err, errWorkControlConflict) {
+					return out, err
+				}
+			}
+			err := deleteIntentRow(t, iid, mode, reason, &out)
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, db.ErrIntentStateConflict) || attempt >= intentDeleteRetries {
 				return out, err
 			}
-			s.cancelWorkerSide(t.ID, t.ExpID, iid)
-			t.NotifyCancelled(iid, summary, reason)
-			out.Deleted = &cleanup
-			out.State = "" // 节点已删除,前端据 Deleted 从列表移除
-		} else {
-			if _, err := t.Store.SoftDeleteIntent(iid, reason); err != nil {
-				return out, err
+			select {
+			case <-ctx.Done():
+				return out, ctx.Err()
+			case <-time.After(intentDeleteRetryDelay):
 			}
-			s.cancelWorkerSide(t.ID, t.ExpID, iid)
-			t.NotifyCancelled(iid, summary, reason)
-			out.State = db.StateIntentDeleted
+			fresh, ferr := t.Store.GetNode(iid)
+			if ferr != nil {
+				return out, ferr
+			}
+			if fresh == nil || (fresh.State != "running" && fresh.State != "paused" && fresh.State != "open") {
+				return out, err // finished or removed meanwhile: nothing left to delete
+			}
+			node = fresh
 		}
+		s.cancelWorkerSide(t.ID, t.ExpID, iid)
+		t.NotifyCancelled(iid, summary, reason)
 	default:
 		return out, fmt.Errorf("action must be pause|resume|cancel")
 	}

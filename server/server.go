@@ -42,8 +42,10 @@ type Server struct {
 	engine *Engine
 	ctx    context.Context
 
-	skillDir string // root directory for skill subdirectories
-	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
+	skillDir string       // root directory for skill subdirectories
+	jwtKey   []byte       // HS256 signing key loaded from / generated into dataDir/jwt.key
+	setup    *setupGate   // one-time token gating /api/auth/init until a password exists
+	pwEpoch  pwEpochCache // when the password last changed; older tokens are rejected
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -60,6 +62,7 @@ type Server struct {
 	llmDirect llm.Provider // concrete global provider, before any failover pool
 	llmCfg    agent.Config // current LLM config (key not exposed)
 	llmOn     bool
+	llmErr    string // why the active config failed to build ("" = fine or none set)
 	llmProf   string // active LLM profile name (for llmrec tagging)
 
 	// chatBusy guards the per-task main-agent run: the chat handler launches the
@@ -147,7 +150,23 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
-	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
+	setup, err := newSetupGate(keyDir)
+	if err != nil {
+		log.Fatalf("[auth] setup token: %v", err)
+	}
+	// Announce the init token only when no password exists; retire a stale one
+	// otherwise. A read error decides nothing here — authStatus announces later,
+	// once the database answers "not initialized".
+	if m != nil && m.pg != nil {
+		if hash, _, err := m.pg.GetSetting(authPassKey); err == nil {
+			if hash == "" {
+				setup.announce()
+			} else {
+				setup.retire()
+			}
+		}
+	}
+	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, setup: setup, chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
@@ -289,9 +308,25 @@ func (s *Server) restoreTaskRuntimes() {
 	// FIFO. Paused loops remain idle; queued tasks are admitted below as slots allow.
 	for _, t := range m.List() {
 		lifecycle := t.lifecycleSnapshot()
-		if !lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
-			s.engine.Run(s.ctx, t)
+		if lifecycle.Queued || isTerminalStatus(lifecycle.Status) {
+			continue
 		}
+		// A task admitted but interrupted during goal decomposition (restart,
+		// self-update, crash) has never run and has no goal nodes. Starting its
+		// loops directly would send the planner down the goalless branch, which
+		// reads "no open goal, no active intent" as finished and marks the task
+		// done without it ever running. Redo the bootstrap instead: decompose
+		// goals first, then start the engine — the same order launchTask uses.
+		if s.resumeAdmissionMode(t) == "bootstrap" {
+			// A paused one must not get loops either: the resume path
+			// (admitPausedTask) bootstraps it, and loops started here would be
+			// woken by that resume before its goals exist.
+			if !lifecycle.Paused {
+				s.startAdmittedTask(t, "bootstrap")
+			}
+			continue
+		}
+		s.engine.Run(s.ctx, t)
 	}
 }
 
@@ -411,11 +446,14 @@ func (s *Server) webSearchFor(key string) agent.WebSearchOpts {
 // the request, and because the UA rides along, another profile's User-Agent too
 // — which is exactly what a UA-keyed gateway groups and rate-limits on.
 // cfg that cannot serve a search (no key/base/model) leaves the fallback intact.
+// So does a non-anthropic cfg: the backend speaks the Anthropic Messages API
+// (POST <base>/v1/messages with x-api-key), so borrowing an OpenAI-format
+// profile would send every search to an endpoint that cannot answer it.
 func mergeSearchCreds(o agent.WebSearchOpts, cfg agent.Config) agent.WebSearchOpts {
 	if o.Backend != deepSeekWebSearchBackend {
 		return o
 	}
-	if cfg.BaseURL == "" || cfg.APIKey == "" || cfg.Model == "" {
+	if cfg.Provider() != "anthropic" || cfg.BaseURL == "" || cfg.APIKey == "" || cfg.Model == "" {
 		return o
 	}
 	o.DeepSeekBaseURL, o.DeepSeekAPIKey, o.DeepSeekModel = cfg.BaseURL, cfg.APIKey, cfg.Model
@@ -500,14 +538,32 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 		// Publish all runtime fields together; readers must never see a new
 		// direct provider paired with an old config, name, or chat agent.
 		s.cfgMu.Lock()
+		wasOn := s.llmOn
 		s.llmDirect, s.llmProv, s.chatAgent = direct, prov, chat
 		s.llmCfg, s.llmProf = current, name
 		s.llmOn = err == nil && prov != nil
+		// Why the active config cannot run, for GET /api/llm: a build failure used
+		// to surface only as configured:false, indistinguishable from "nothing set".
+		s.llmErr = ""
+		if err != nil {
+			s.llmErr = err.Error()
+		}
 		s.cfgMu.Unlock()
 		s.profMu.Unlock()
 		s.invalidateTaskAgents()
 		if err == nil && prov != nil {
-			if t := s.m.ActiveTask(); t != nil {
+			if !wasOn {
+				// The LLM just became usable. Every task admitted while it was
+				// not (no concurrency cap → nothing queued) consumed its planner
+				// wake-up on a no-op round and would otherwise sit until the next
+				// heartbeat (≥10 min). Only on this transition: waking every planner
+				// on each config save would cost each running task an LLM round.
+				for _, t := range s.m.List() {
+					if lifecycle := t.lifecycleSnapshot(); !lifecycle.Paused && !lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
+						t.Notify()
+					}
+				}
+			} else if t := s.m.ActiveTask(); t != nil {
 				t.Notify()
 			}
 		}
@@ -1050,6 +1106,9 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{}
 	out["engine_mode"] = "idle"              // spec enum; overridden below when a task is active
 	out["llm_configured"] = s.engine.Ready() // is an LLM provider installed at all
+	s.cfgMu.Lock()
+	out["llm_error"] = s.llmErr // non-empty: a config is set but cannot be built ("配置无效", not "未配置")
+	s.cfgMu.Unlock()
 	if tr := s.m.Traffic(); tr != nil {
 		c, _ := tr.Count()
 		out["traffic"] = c
@@ -1388,6 +1447,7 @@ func (s *Server) getLLM(w http.ResponseWriter, r *http.Request) {
 	defer s.cfgMu.Unlock()
 	writeJSON(w, 200, map[string]any{
 		"configured":       s.llmOn,
+		"error":            s.llmErr, // why the active config failed to build; "" when fine or unset
 		"provider":         s.llmCfg.Provider(),
 		"model":            s.llmCfg.Model,
 		"base_url":         s.llmCfg.BaseURL,
@@ -1432,8 +1492,14 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 	}
 	if cfg.APIKey == "" {
 		s.cfgMu.Lock()
-		cfg.APIKey = s.llmCfg.APIKey // keep existing key if not re-entered
+		active := s.llmCfg
 		s.cfgMu.Unlock()
+		// keep existing key if not re-entered — but only for the same destination
+		if active.APIKey != "" && !sameKeyDestination(active, cfg) {
+			writeErr(w, 400, errKeyDestinationChanged)
+			return
+		}
+		cfg.APIKey = active.APIKey
 	}
 	if cfg.APIKey == "" {
 		writeErr(w, 400, "api_key required")
@@ -1515,6 +1581,10 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	if req.ProfileID != nil && (cfg.APIKey == "" || req.SessionHeaderKey == nil || req.UserAgent == nil || req.MaxTokensField == nil) {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
 			if cfg.APIKey == "" {
+				if !sameKeyDestination(profileDestination(p), cfg) {
+					writeJSON(w, 200, map[string]any{"ok": false, "error": errKeyDestinationChanged})
+					return
+				}
 				cfg.APIKey = p.APIKey
 			}
 			if req.SessionHeaderKey == nil {
@@ -1534,8 +1604,13 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	}
 	if cfg.APIKey == "" {
 		s.cfgMu.Lock()
-		cfg.APIKey = s.llmCfg.APIKey
+		active := s.llmCfg
 		s.cfgMu.Unlock()
+		if active.APIKey != "" && !sameKeyDestination(active, cfg) {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": errKeyDestinationChanged})
+			return
+		}
+		cfg.APIKey = active.APIKey
 	}
 	if cfg.APIKey == "" {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": "未提供 API Key"})
@@ -3648,10 +3723,14 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		s.m.webSearchProxy = *req.WebSearchProxy
 	}
 	s.m.mu.Unlock()
+	// Everything below follows a committed transaction, so a failure is a warning
+	// on a 200, not a 500: the change is real, and returning early would also skip
+	// the remaining follow-ups (browser MCP proxy sync, concurrency, LLM rebuild),
+	// leaving runtime state half-applied.
+	var warnings []string
 	if req.GlobalProxy != nil && s.m.traffic != nil {
 		if err := s.m.traffic.SetUpstreamProxy(*req.GlobalProxy); err != nil {
-			writeErr(w, 500, err.Error())
-			return
+			warnings = append(warnings, "全局代理已保存，但流量代理上游更新失败: "+err.Error())
 		}
 	}
 	if req.GlobalProxy != nil || req.TrafficCapture != nil {
@@ -3671,12 +3750,15 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		s.cfgMu.Unlock()
 		if on {
 			if err := s.applyLLM(cfg); err != nil {
-				writeErr(w, 500, err.Error())
-				return
+				warnings = append(warnings, "设置已保存，但模型客户端更新失败: "+err.Error())
 			}
 		}
 	}
-	writeJSON(w, 200, s.settingsPayload())
+	payload := s.settingsPayload()
+	if len(warnings) > 0 {
+		payload["warning"] = strings.Join(warnings, "；")
+	}
+	writeJSON(w, 200, payload)
 }
 
 // testWebSearch runs a real "test" search with the given (or currently saved)
@@ -4003,9 +4085,17 @@ func (s *Server) gc(w http.ResponseWriter, r *http.Request) {
 
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		// The token-issuing endpoints are never cross-origin readable: with "*", any
+		// web page the operator visits could read the JWT that /api/auth/login or
+		// /init returns (a text/plain POST needs no preflight). The UI calls them
+		// same-origin. Every other route keeps "*" for the cross-origin SSE of dev
+		// mode and NEXT_PUBLIC_SSE_BASE deployments; those require a token the page
+		// cannot get, and "*" never exposes a credentialed response.
+		if !strings.HasPrefix(r.URL.Path, "/api/auth/") {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(204)
 			return

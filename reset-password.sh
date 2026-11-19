@@ -232,4 +232,4 @@ else
 fi
 
 unset ARTEX_RESET_NEWPASS
-echo "✓ 已重置 ARTEX 管理员密码。请用用户名 ARTEX + 新密码登录（无需重启服务）。"
+echo "✓ 已重置 ARTEX 管理员密码。请用用户名 ARTEX + 新密码登录（无需重启服务；此前签发的登录 token 会在数秒内全部失效）。"

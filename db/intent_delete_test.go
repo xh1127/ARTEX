@@ -1,6 +1,9 @@
 package db
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 // mustIntent / mustNode / mustLink are terse builders for the delete-cascade tests.
 func mustIntent(t *testing.T, es *ExplorationStore, summary string) int64 {
@@ -166,5 +169,97 @@ func TestHardDeletePreservesSharedAndGoal(t *testing.T) {
 		if gone(t, es, id) {
 			t.Fatalf("node %d was wrongly cascaded", id)
 		}
+	}
+}
+
+// A worker can claim an open intent between the API's state read and its delete.
+// Both deletes must refuse a running intent under the row lock — otherwise the
+// intent is gone while its worker keeps executing and writing — and the blocked
+// settlement of a run must never resurrect an intent the user deleted.
+func TestDeleteRefusesRunningIntentAndSettlementCannotResurrect(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+	expID, err := d.CreateExploration("delete race", "删除竞态")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	es := d.Exploration(expID)
+
+	running := mustIntent(t, es, "被并发领走的意图")
+	if claimed, err := es.ClaimIntent(running, "work#1"); err != nil || !claimed {
+		t.Fatalf("claim: %v %v", claimed, err)
+	}
+	if _, err := es.SoftDeleteIntent(running, "删掉"); !errors.Is(err, ErrIntentStateConflict) {
+		t.Fatalf("soft delete of a running intent: err=%v, want ErrIntentStateConflict", err)
+	}
+	if _, err := es.CancelIntent(running); !errors.Is(err, ErrIntentStateConflict) {
+		t.Fatalf("hard delete of a running intent: err=%v, want ErrIntentStateConflict", err)
+	}
+	if n, err := es.GetNode(running); err != nil || n == nil || n.State != "running" {
+		t.Fatalf("refused delete changed the intent: %+v %v", n, err)
+	}
+
+	// The run settles blocked while still running: allowed.
+	if ok, err := es.SettleIntentBlocked(running, IntentBlockedLLMQuota); err != nil || !ok {
+		t.Fatalf("settle running → blocked: ok=%v err=%v", ok, err)
+	}
+
+	// The user deletes (after the work stopped: paused), then a late settlement
+	// arrives. It must not turn 'deleted' back into 'blocked'.
+	late := mustIntent(t, es, "删除后才结算的意图")
+	if err := es.SetIntentState(late, "paused"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := es.SoftDeleteIntent(late, "不要了"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := es.SettleIntentBlocked(late, IntentBlockedLLMQuota); err != nil || ok {
+		t.Fatalf("late settlement on a deleted intent: ok=%v err=%v, want no-op", ok, err)
+	}
+	if n, err := es.GetNode(late); err != nil || n == nil || n.State != StateIntentDeleted {
+		t.Fatalf("deleted intent was resurrected: %+v %v", n, err)
+	}
+	if reopened, err := es.ReopenIntentsByBlockedReason(IntentBlockedLLMQuota); err != nil {
+		t.Fatal(err)
+	} else if n, _ := es.GetNode(late); n == nil || n.State != StateIntentDeleted || reopened != 1 {
+		t.Fatalf("reopen touched the deleted intent or missed the blocked one: reopened=%d state=%+v", reopened, n)
+	}
+}
+
+// A goalless task finishes when no intent can still run. One the user paused (to
+// message it) is held, not finished: HasPendingIntent must count it, while
+// HasActiveIntent — used for the first-round kick and stall prompts — must not.
+func TestHasPendingIntentCountsUserPausedWork(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+	expID, err := d.CreateExploration("pending intent", "暂停的意图不算跑完")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	es := d.Exploration(expID)
+
+	intent := mustIntent(t, es, "用户暂停后要发消息的意图")
+	if err := es.SetIntentState(intent, "paused"); err != nil {
+		t.Fatal(err)
+	}
+	if active, err := es.HasActiveIntent(); err != nil || active {
+		t.Fatalf("HasActiveIntent=%v err=%v, want false for a paused-only frontier", active, err)
+	}
+	if pending, err := es.HasPendingIntent(); err != nil || !pending {
+		t.Fatalf("HasPendingIntent=%v err=%v, want true while an intent is paused", pending, err)
+	}
+	if err := es.SetIntentState(intent, "done"); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := es.HasPendingIntent(); err != nil || pending {
+		t.Fatalf("HasPendingIntent=%v err=%v, want false once nothing can run", pending, err)
 	}
 }

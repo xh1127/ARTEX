@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -191,6 +192,23 @@ func TestDeleteCancellationReturnsRunningIntentToFrontier(t *testing.T) {
 	}
 }
 
+// A shutdown cancels the process root context; workers run on contexts derived
+// from it. Their in-flight intents must go back to the frontier (open), not be
+// settled as blocked — the restart only resets rows still marked running.
+func TestShutdownCancellationReturnsRunningIntentToFrontier(t *testing.T) {
+	if !taskExecutionPaused(agent.AbortShutdown) {
+		t.Fatal("shutdown cancellation must settle a running intent as open so the next process re-claims it")
+	}
+	root, cancel := context.WithCancelCause(context.Background())
+	e := NewEngine(nil)
+	child := e.execContextFor(root, "t1")
+	cancel(agent.AbortShutdown)
+	<-child.Done()
+	if !taskExecutionPaused(context.Cause(child)) {
+		t.Fatalf("derived execution context cause=%v was not recognized as shutdown", context.Cause(child))
+	}
+}
+
 func TestResumeDoesNotClearDeleteBarrier(t *testing.T) {
 	e := NewEngine(nil)
 	task := &Task{ID: "t1", notify: make(chan struct{}, 1)}
@@ -213,5 +231,52 @@ func TestBootstrapAdmissionClearsQueuedPauseBarrier(t *testing.T) {
 	s.startAdmittedTask(task, "bootstrap")
 	if e.IsPaused(task.ID) {
 		t.Fatal("bootstrap admission left the queued task behind the pause barrier")
+	}
+}
+
+// Worker loops outlive a finished task on purpose (a rerun revives it and Run
+// only nudges existing loops), so their idling must cost nothing. Resolving the
+// task's agents reads the database; it used to happen before the terminal check,
+// so every worker of every finished task queried once a second, forever.
+func TestWorkerLoopIdlesTerminalTaskWithoutResolvingAgents(t *testing.T) {
+	task := &Task{ID: "t-done", notify: make(chan struct{}, 1)}
+	task.updateLifecycle(func(state *taskLifecycleState) { state.Status = "done" })
+	e := NewEngine(&Manager{tasks: map[string]*Task{task.ID: task}})
+	var resolves atomic.Int32
+	e.SetAuthoritativeAgentResolver(func(*Task) (*agent.Planner, *agent.Worker) {
+		resolves.Add(1)
+		return nil, nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	e.workerLoop(ctx, task, "w1") // returns once ctx ends
+	if n := resolves.Load(); n != 0 {
+		t.Fatalf("worker loop resolved agents %d times for a finished task; idling must not touch the database", n)
+	}
+}
+
+// A steer that saw the work alive must never leave a message behind once the
+// work is detached: the next re-run of the same intent would receive a stale
+// course-correction meant for the old run. Stress the check-then-append window.
+func TestSteerWorkNeverStrandsMessageAfterDetach(t *testing.T) {
+	e := NewEngine(nil)
+	const intentID = 42
+	for i := 0; i < 5000; i++ {
+		_, cancel := context.WithCancelCause(context.Background())
+		e.registerWork(intentID, cancel)
+		done := make(chan struct{})
+		go func() {
+			_ = e.SteerWork(intentID, "steer")
+			close(done)
+		}()
+		e.detachWork(intentID)
+		<-done
+		e.steerMu.Lock()
+		left := len(e.steerBox[intentID])
+		delete(e.steerBox, intentID)
+		e.steerMu.Unlock()
+		if left != 0 {
+			t.Fatalf("iteration %d: %d steering message(s) stranded after the work was detached", i, left)
+		}
 	}
 }

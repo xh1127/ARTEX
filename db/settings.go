@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"sort"
+	"time"
 )
 
 // Settings is a tiny key-value store for global app config the UI toggles at
@@ -19,6 +20,20 @@ func (d *DB) GetSetting(key string) (value string, ok bool, err error) {
 		return "", false, err
 	}
 	return value, true, nil
+}
+
+// SettingUpdatedAt returns when key was last written; ok=false when it is absent.
+// Every write path stamps it — SetSetting/SetSettings, InsertSettingIfAbsent
+// (column default) and out-of-process upserts such as reset-password.sh.
+func (d *DB) SettingUpdatedAt(key string) (at time.Time, ok bool, err error) {
+	err = d.QueryRow(`SELECT updated_at FROM settings WHERE key=$1`, key).Scan(&at)
+	if err == sql.ErrNoRows {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return at, true, nil
 }
 
 // SetSetting upserts a setting value.

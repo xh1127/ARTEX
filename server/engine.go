@@ -411,10 +411,13 @@ func (e *Engine) detachWork(intentID int64) (action string, complete func(error)
 		action = run.action
 		run.cancel(agent.AbortWorkFinished) // release resources (no-op if already cancelled)
 	}
-	e.workMu.Unlock()
+	// Dropped under workMu, the lock SteerWork queues under (order workMu →
+	// steerMu in both): a steer that saw this work alive can no longer append
+	// after the drop and strand a message for a later re-run of the intent.
 	e.steerMu.Lock()
 	delete(e.steerBox, intentID) // drop any undelivered steering for a finished work
 	e.steerMu.Unlock()
+	e.workMu.Unlock()
 	if run == nil {
 		return action, func(error) {}
 	}
@@ -495,11 +498,12 @@ func (e *Engine) SteerWork(intentID int64, msg string) error {
 		return fmt.Errorf("纠偏消息不能为空")
 	}
 	e.workMu.Lock()
-	running := e.work[intentID] != nil
-	e.workMu.Unlock()
-	if !running {
+	defer e.workMu.Unlock()
+	if e.work[intentID] == nil {
 		return fmt.Errorf("意图 %d 当前没有运行中的 work（可能已结束或未被领取）", intentID)
 	}
+	// Queue while still holding workMu (see detachWork): checking liveness and
+	// appending under separate locks let a message land after the work finished.
 	e.steerMu.Lock()
 	e.steerBox[intentID] = append(e.steerBox[intentID], msg)
 	e.steerMu.Unlock()
@@ -840,11 +844,12 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		}
 		// goalless（人工直投）分支：任务已无 open 目标时 planner 不跑——跑了会重判
 		// met→cancelExec 杀掉用户经主 agent 直投的意图。是否结束改由 frontier 决定：
-		// 还有 open/running 意图 → 保持 running、静默等待；意图已全部跑干 → 落 done。
+		// 还有 open/running/paused 意图 → 保持 running、静默等待（paused 是用户按住的，
+		// 不是跑完了）；意图已全部跑干 → 落 done。
 		// 整段纯 Go、不触发任何 LLM 调用，也不打规划轮 marker。
 		if open, err := t.Store.HasOpenGoal(); err == nil && !open {
 			t.drainTriggers() // 丢弃累积的 done/finding 触发，避免 goalless 长会话里无界增长
-			if active, err := t.Store.HasActiveIntent(); err == nil && !active {
+			if active, err := t.Store.HasPendingIntent(); err == nil && !active {
 				// frontier 抽干且无在跑意图 → 收尾。用 Guarded 版做 CAS，避免踩到并发的
 				// pause/delete/超时收尾的状态转换。
 				if won, err := e.m.SetTaskStatusGuarded(t.ID, "done"); err != nil {
@@ -883,9 +888,19 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		case err != nil && ectx.Err() == nil:
 			log.Printf("[planner] task %s 规划出错: %v", t.ID, err)
 		case met:
+			// Plan runs for tens of seconds. A goal added meanwhile (main agent,
+			// finding follow-up) makes this verdict stale: recording it would mark
+			// a task with an open goal done, and the terminal gate would then
+			// swallow the very wake-up meant to plan for that goal. Re-plan instead.
+			if open, gerr := t.Store.HasOpenGoal(); gerr == nil && open {
+				log.Printf("[planner] task %s 判定达成后又出现了未完成目标，忽略本次判定并重新规划", t.ID)
+				t.Notify()
+				break
+			}
 			log.Printf("[planner] task %s 判定目标达成: %s", t.ID, reason)
-			// 所有目标达成 → 持久化任务状态为 done（前端 DTO 会优先展示该终态）。
-			if err := e.m.SetTaskStatus(t.ID, "done"); err != nil {
+			// 所有目标达成 → 持久化任务状态为 done（前端 DTO 会优先展示该终态）。Guarded:
+			// 并发的超时收尾若已先落终态，以先到者为准，不互相覆盖。
+			if _, err := e.m.SetTaskStatusGuarded(t.ID, "done"); err != nil {
 				log.Printf("[planner] task %s 标记完成落库失败: %v", t.ID, err)
 			}
 			// 任务已判完成 → 立刻取消在跑的 worker：它们手头的意图跑出来也没意义了。
@@ -920,13 +935,15 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 			return
 		default:
 		}
-		_, worker := e.snapshotFor(t)
-		if worker == nil {
-			if sleepCtx(ctx, 1500*time.Millisecond) {
-				return
-			}
-			continue
-		}
+		// The in-memory gates come first. snapshotFor resolves the task's agents
+		// (DB reads for agent bindings on every call); it used to run before them,
+		// so each worker of every paused or finished task kept querying the
+		// database once a second for the rest of the process's life. These loops
+		// stay alive for terminal tasks on purpose — a rerun/follow-up revives the
+		// task and Run only nudges loops that already exist — so idling must be free.
+		// Paused is checked before deleting, as before: BeginDelete raises the pause
+		// barrier, so workers park here and an aborted delete resumes them instead
+		// of finding they all returned.
 		if e.IsPaused(t.ID) {
 			if sleepCtx(ctx, 1000*time.Millisecond) {
 				return
@@ -947,6 +964,13 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 				return
 			}
 			continue // 任务已终态(done/failed/timeout):停止领取遗留意图,别在完成后空跑 frontier
+		}
+		_, worker := e.snapshotFor(t)
+		if worker == nil {
+			if sleepCtx(ctx, 1500*time.Millisecond) {
+				return
+			}
+			continue
 		}
 		if !e.beginTaskOperation(t.ID) {
 			return
@@ -1144,7 +1168,10 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		log.Printf("[worker %s] intent %d 运行超时(exhausted)，收尾后写回 %s", name, intent.ID, wrote)
 	}
 	if state == "blocked" && isTaskLLMChainExhausted(err) {
-		_ = t.Store.SetIntentBlockedReason(intent.ID, db.IntentBlockedLLMQuota)
+		// Guarded on running: a user delete (or pause) that landed during the run wins.
+		if _, settleErr := t.Store.SettleIntentBlocked(intent.ID, db.IntentBlockedLLMQuota); settleErr != nil {
+			log.Printf("[worker %s] task %s 意图 #%d 额度阻塞落库失败: %v", name, t.ID, intent.ID, settleErr)
+		}
 	} else {
 		if stateErr := transitionIntentState(t.Store, intent.ID, "running", state); stateErr != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 终态 %s 落库失败: %v", name, t.ID, intent.ID, state, stateErr)
@@ -1218,7 +1245,12 @@ func taskExecutionPaused(cause error) bool {
 	}
 	switch abort.Code {
 	case "paused_by_user", "paused_by_orchestrator", "paused_on_reload", "paused_race_guard",
-		"queued_for_admission", "llm_unavailable_queued", "task_deleted":
+		"queued_for_admission", "llm_unavailable_queued", "task_deleted",
+		// Process shutdown (stop / restart / self-update) cut the run short; it did
+		// not fail. Hand the intent back so the next process re-claims it, as
+		// AbortShutdown promises. Settling it as blocked would strand it for good:
+		// the startup reset (ResetRunningIntents) only revives rows still running.
+		"shutdown":
 		return true
 	default:
 		return false

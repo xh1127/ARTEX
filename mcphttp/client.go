@@ -72,13 +72,23 @@ type Client struct {
 	messageURL   string
 	streamBody   io.ReadCloser
 	streamCancel context.CancelFunc
-	streamDone   chan struct{}
-	legacyMu     sync.Mutex
-	pendingMu    sync.Mutex
-	pending      map[int]chan *rpcResponse
-	streamErr    chan error
-	protocol     string
+	// streamDone is closed when the SSE stream ends; streamFail holds why. It is
+	// written only before that close, so read it only after <-streamDone. A closed
+	// channel reaches every waiter — the old one-slot error channel woke only the
+	// first, and every later call then waited for a response that could not come.
+	streamDone chan struct{}
+	streamFail error
+	// legacySem serializes calls (capacity 1). A channel rather than a Mutex so a
+	// caller waiting behind a slow call can still give up when its ctx ends.
+	legacySem chan struct{}
+	pendingMu sync.Mutex
+	pending   map[int]chan *rpcResponse
+	protocol  string
 }
+
+// sseHandshakeTimeout bounds connecting to a legacy SSE server: response headers
+// plus the initial "endpoint" event. A var so tests can shorten it.
+var sseHandshakeTimeout = 30 * time.Second
 
 func normalizeHeaders(headers map[string]string) (map[string]string, error) {
 	out := make(map[string]string, len(headers))
@@ -131,8 +141,30 @@ func NewSSE(ctx context.Context, server, sseURL string, headers map[string]strin
 		hc.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	}
 	streamCtx, cancel := context.WithCancel(context.Background())
+	// The stream outlives this call, so it is not derived from ctx. The handshake
+	// is, though: it is cut short when ctx ends or after sseHandshakeTimeout. A
+	// server that accepts the GET but never announces an endpoint (e.g. a
+	// Streamable-HTTP server configured as "sse") used to block agent assembly
+	// for every task that could see it, forever.
+	stopCtxWatch := context.AfterFunc(ctx, cancel)
+	handshakeTimer := time.AfterFunc(sseHandshakeTimeout, cancel)
+	// endHandshake detaches the stream from ctx and the timer. Call exactly once.
+	// It reports why the handshake was cut short, which beats the I/O error the
+	// cancellation caused.
+	endHandshake := func(ioErr error) error {
+		ctxFired := !stopCtxWatch()
+		timerFired := !handshakeTimer.Stop()
+		switch {
+		case ctxFired && ctx.Err() != nil:
+			return fmt.Errorf("mcp sse handshake: %w", ctx.Err())
+		case timerFired:
+			return fmt.Errorf("mcp sse handshake timed out after %s (no endpoint event)", sseHandshakeTimeout)
+		}
+		return ioErr
+	}
 	req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, sseURL, nil)
 	if err != nil {
+		_ = endHandshake(nil)
 		cancel()
 		return nil, err
 	}
@@ -142,17 +174,19 @@ func NewSSE(ctx context.Context, server, sseURL string, headers map[string]strin
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
+		err = endHandshake(err)
 		cancel()
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
+		_ = endHandshake(nil)
 		cancel()
 		return nil, fmt.Errorf("mcp sse http %d: %s", resp.StatusCode, readSnippet(resp.Body))
 	}
 	reader := bufio.NewReader(resp.Body)
 	endpoint, err := readSSEEndpoint(reader, sseURL)
-	if err != nil {
+	if err = endHandshake(err); err != nil {
 		resp.Body.Close()
 		cancel()
 		return nil, err
@@ -167,8 +201,8 @@ func NewSSE(ctx context.Context, server, sseURL string, headers map[string]strin
 		streamBody:   resp.Body,
 		streamCancel: cancel,
 		streamDone:   make(chan struct{}),
+		legacySem:    make(chan struct{}, 1),
 		pending:      make(map[int]chan *rpcResponse),
-		streamErr:    make(chan error, 1),
 		protocol:     legacySSEProtocolVersion,
 	}
 	go c.readLegacySSE(reader)
@@ -197,28 +231,28 @@ func readSSEEndpoint(r *bufio.Reader, base string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("mcp sse endpoint URL: %w", err)
 		}
-		if !u.IsAbs() {
-			b, err := url.Parse(base)
-			if err != nil {
-				return "", err
-			}
-			candidate = b.ResolveReference(u).String()
+		b, err := url.Parse(base)
+		if err != nil {
+			return "", err
 		}
-		return candidate, nil
+		resolved := b.ResolveReference(u)
+		// Every call POSTs the configured headers — Authorization included — to
+		// this URL, so it must stay on the server we were configured for. An
+		// injected or hostile "endpoint" event naming another origin would
+		// otherwise receive the bearer token, or aim our POSTs at internal hosts.
+		if !strings.EqualFold(resolved.Scheme, b.Scheme) || !strings.EqualFold(resolved.Host, b.Host) {
+			return "", fmt.Errorf("mcp sse endpoint %s is not on the SSE server's origin %s://%s", resolved.Redacted(), b.Scheme, b.Host)
+		}
+		return resolved.String(), nil
 	}
 }
 
 func (c *Client) readLegacySSE(r *bufio.Reader) {
-	defer close(c.streamDone)
+	defer close(c.streamDone) // after streamFail is set: waiters see it
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
-			if !errors.Is(err, context.Canceled) {
-				select {
-				case c.streamErr <- err:
-				default:
-				}
-			}
+			c.streamFail = err
 			return
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -481,8 +515,14 @@ func (c *Client) roundTrip(ctx context.Context, body rpcRequest, expectResp bool
 func (c *Client) legacyRoundTrip(ctx context.Context, body rpcRequest, expectResp bool) (*rpcResponse, error) {
 	// Serializing calls keeps the first implementation deterministic while the
 	// shared SSE reader still handles asynchronous delivery.
-	c.legacyMu.Lock()
-	defer c.legacyMu.Unlock()
+	select {
+	case c.legacySem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.streamDone:
+		return nil, c.streamClosedErr()
+	}
+	defer func() { <-c.legacySem }()
 
 	data, err := json.Marshal(body)
 	if err != nil {
@@ -523,11 +563,25 @@ func (c *Client) legacyRoundTrip(ctx context.Context, body rpcRequest, expectRes
 	select {
 	case response := <-responseCh:
 		return response, nil
-	case err := <-c.streamErr:
-		return nil, fmt.Errorf("mcp sse stream: %w", err)
+	case <-c.streamDone:
+		// A response delivered just before the stream ended still counts.
+		select {
+		case response := <-responseCh:
+			return response, nil
+		default:
+		}
+		return nil, c.streamClosedErr()
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// streamClosedErr describes the ended SSE stream. Only call after <-c.streamDone.
+func (c *Client) streamClosedErr() error {
+	if c.streamFail == nil {
+		return errors.New("mcp sse stream closed")
+	}
+	return fmt.Errorf("mcp sse stream: %w", c.streamFail)
 }
 
 // parseSSE reads an SSE stream and returns the first data frame that is a JSON-RPC

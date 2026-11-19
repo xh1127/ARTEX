@@ -820,3 +820,64 @@ func TestPauseTaskToolUsesOrchestratorCancellationCause(t *testing.T) {
 		t.Fatalf("pause_task cancellation code=%q ok=%v, want paused_by_orchestrator", code, ok)
 	}
 }
+
+// A restart that lands while an admitted task is still decomposing goals leaves
+// it non-queued, non-terminal, never run and goalless. Restore must redo the
+// bootstrap rather than start its loops: a planner running on a goalless task
+// takes the goalless branch and marks it done without it ever running. The
+// fixture's server context is already cancelled, so the bootstrap goroutine
+// exits before decomposing — which makes "loops not started" observable.
+func TestRestoreDoesNotStartLoopsForInterruptedBootstrap(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer m.Close()
+
+	interrupted, err := m.CreateTask("interrupted bootstrap", "decomposition never finished", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pausedInterrupted, err := m.CreateTask("paused interrupted bootstrap", "decomposition never finished", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decomposed, err := m.CreateTask("decomposed before restart", "goals already exist", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newAdmissionTestServer(m, nil)
+	defer func() {
+		for _, task := range m.List() {
+			s.engine.StopTask(task.ID)
+		}
+		for _, task := range []*Task{interrupted, pausedInterrupted, decomposed} {
+			_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{})
+		}
+	}()
+	if _, err := decomposed.Store.AddNode(db.KindGoal, map[string]any{"text": "existing goal"}, 0, "open", "system", nil); err != nil {
+		t.Fatal(err)
+	}
+	pausedID, _ := strconv.ParseInt(pausedInterrupted.ID, 10, 64)
+	if err := m.pg.SetPaused(pausedID, true); err != nil {
+		t.Fatal(err)
+	}
+	pausedInterrupted.updateLifecycle(func(state *taskLifecycleState) { state.Paused = true })
+
+	s.restoreTaskRuntimes()
+
+	if s.engine.Started(interrupted.ID) {
+		t.Fatal("restore started loops for a task interrupted during goal decomposition; its planner would mark it done")
+	}
+	if s.engine.Started(pausedInterrupted.ID) {
+		t.Fatal("restore started loops for a paused never-bootstrapped task; resume would wake them before goals exist")
+	}
+	if !s.engine.Started(decomposed.ID) {
+		t.Fatal("restore must still start loops for a task whose goals already exist")
+	}
+	for _, task := range []*Task{interrupted, pausedInterrupted} {
+		if status := task.lifecycleSnapshot().Status; isTerminalStatus(status) {
+			t.Fatalf("task %s was settled as %q by restore", task.ID, status)
+		}
+	}
+}

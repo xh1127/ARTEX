@@ -3,6 +3,8 @@
 // a few fields the backend serializes differently (e.g. created_at as a unix int)
 // are passed through and formatted at the call site.
 
+import { toast } from "sonner";
+
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
@@ -144,7 +146,22 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(message);
   }
   if (r.status === 204) return undefined as T;
-  return r.json();
+  const payload = (await r.json()) as T;
+  surfaceWarning(payload);
+  return payload;
+}
+
+// A 2xx carrying `warning` means the change was committed but a runtime
+// follow-up failed (e.g. the model client could not be rebuilt). It is not a
+// failure — treating it as one made the UI retry the change, and a retried
+// create inserted a duplicate — but the user still has to see it. Surfaced here
+// once so every caller gets it without handling it individually.
+function surfaceWarning(payload: unknown) {
+  if (typeof window === "undefined" || !payload || typeof payload !== "object") return;
+  const warning = (payload as { warning?: unknown }).warning;
+  if (typeof warning === "string" && warning.trim()) {
+    toast.warning(warning.trim(), { duration: 15000 });
+  }
 }
 
 // sseUrl builds a URL for Server-Sent Events streams.
@@ -239,9 +256,13 @@ export const api = {
   // ---- auth ----
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),
   login: (username: string, password: string) => post<{ token: string }>("/auth/login", { username, password }),
-  initPassword: (password: string) => post<{ token: string }>("/auth/init", { password }),
+  initPassword: (password: string, setup_token: string) =>
+    post<{ token: string }>("/auth/init", { password, setup_token }),
   changePassword: (oldPassword: string, newPassword: string) =>
-    post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
+    post<{ ok: boolean; token?: string }>("/auth/change-password", {
+      old_password: oldPassword,
+      new_password: newPassword,
+    }),
 
   // ---- tasks ----
   tasks: () =>
@@ -909,6 +930,7 @@ export const api = {
   getLLM: () =>
     get<{
       configured: boolean;
+      error?: string; // why the active config failed to build
       provider: string;
       model: string;
       base_url: string;
@@ -982,7 +1004,7 @@ export const api = {
     session_header_key?: string; // 非空=每次请求带该 HTTP 头，头值=当前会话 session id；""=不发送
     user_agent?: string;
     retry?: LLMRetryOverride; // 本配置的重试覆盖；各项留 0 = 跟随全局重试策略
-  }) => post<{ id: number }>("/llm/profiles", p),
+  }) => post<{ id: number; warning?: string }>("/llm/profiles", p),
   deleteLLMProfile: (id: string) => del<{ deleted: number }>(`/llm/profiles/${id}`),
   activateLLMProfile: (id: string) => post<{ ok: boolean }>("/llm/profiles/active", { id: Number(id) }),
   // 轮询链的实际顺序 + 各配置的熔断状态。

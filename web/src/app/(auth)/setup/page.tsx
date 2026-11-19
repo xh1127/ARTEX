@@ -12,6 +12,7 @@ import { auth } from "@/lib/auth";
 
 export default function SetupPage() {
   const router = useRouter();
+  const [setupToken, setSetupToken] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState("");
@@ -36,6 +37,10 @@ export default function SetupPage() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (!setupToken.trim()) {
+      setError("请填写初始化令牌");
+      return;
+    }
     if (password !== confirm) {
       setError("两次输入的密码不一致");
       return;
@@ -47,7 +52,7 @@ export default function SetupPage() {
     setLoading(true);
     setError("");
     try {
-      const { token } = await api.initPassword(password);
+      const { token } = await api.initPassword(password, setupToken.trim());
       auth.setToken(token);
       router.replace("/function/tasks");
     } catch (err) {
@@ -93,6 +98,24 @@ export default function SetupPage() {
           ) : (
             <form onSubmit={handleSubmit} className="flex flex-col gap-4">
               <div className="space-y-1.5">
+                <Label htmlFor="setup-token">初始化令牌</Label>
+                <Input
+                  id="setup-token"
+                  value={setupToken}
+                  onChange={(e) => setSetupToken(e.target.value)}
+                  placeholder="xxxx-xxxx-xxxx-xxxx"
+                  className="font-mono"
+                  autoFocus
+                  autoComplete="off"
+                  spellCheck={false}
+                  aria-describedby="setup-token-help"
+                />
+                <p id="setup-token-help" className="text-muted-foreground text-xs">
+                  首次启动时打印在服务日志里（Docker 部署可用 <code>docker logs</code> 查看），也写在程序目录下的
+                  setup-token 文件中。它只用来证明你能访问这台服务器，设置成功后自动作废。
+                </p>
+              </div>
+              <div className="space-y-1.5">
                 <Label htmlFor="password">新密码</Label>
                 <Input
                   id="password"
@@ -100,7 +123,6 @@ export default function SetupPage() {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="至少 8 位"
-                  autoFocus
                   autoComplete="new-password"
                 />
               </div>
@@ -116,7 +138,11 @@ export default function SetupPage() {
                 />
               </div>
               {error && <p className="text-sm text-destructive">{error}</p>}
-              <Button type="submit" className="w-full" disabled={loading || !password || !confirm}>
+              <Button
+                type="submit"
+                className="w-full"
+                disabled={loading || !setupToken.trim() || !password || !confirm}
+              >
                 {loading ? "保存中..." : "设置密码并登录"}
               </Button>
             </form>

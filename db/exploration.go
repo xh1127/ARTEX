@@ -402,7 +402,15 @@ func (s *ExplorationStore) SoftDeleteIntent(id int64, reason string) (string, er
 		}
 		return "", err
 	}
-	if state != "running" && state != "paused" && state != "open" {
+	// running is refused, not deleted: a live worker would keep executing and
+	// writing for an intent the user deleted. The caller stops the work first
+	// (it settles running → paused) and retries; checked here, under FOR UPDATE,
+	// because a check made before this transaction can be stale — a worker may
+	// claim an open intent in between.
+	if state == "running" {
+		return "", fmt.Errorf("%w: intent is running; stop its work before deleting", ErrIntentStateConflict)
+	}
+	if state != "paused" && state != "open" {
 		return "", fmt.Errorf("%w: intent state %s cannot be deleted", ErrIntentStateConflict, state)
 	}
 	if _, err := tx.Exec(`UPDATE exploration_nodes
@@ -439,14 +447,20 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 	}
 	defer tx.Rollback()
 
-	// 锁定意图行确认存在(幂等:已删则 not found)。状态不校验——真删除对任何状态成立,
-	// running 的 worker 由调用方先停。
-	if err := tx.QueryRow(`SELECT 1 FROM exploration_nodes
-		WHERE id=$1 AND exploration_id=$2 AND kind='intent' FOR UPDATE`, id, s.expID).Scan(new(int)); err != nil {
+	// 锁定意图行确认存在(幂等:已删则 not found)。其它状态都可真删除,唯独 running 拒绝:
+	// 在跑的 worker 会继续写入一个已被删除的意图(真删除下其 activity/fact 还会撞外键、
+	// 留下孤儿节点)。调用方先停掉 work(running → paused)再删;在这里、在行锁内判定,
+	// 因为事务之前读到的状态可能已过时——worker 可能恰好在两者之间领走了 open 意图。
+	var state string
+	if err := tx.QueryRow(`SELECT state FROM exploration_nodes
+		WHERE id=$1 AND exploration_id=$2 AND kind='intent' FOR UPDATE`, id, s.expID).Scan(&state); err != nil {
 		if err == sql.ErrNoRows {
 			return out, fmt.Errorf("intent not found")
 		}
 		return out, err
+	}
+	if state == "running" {
+		return out, fmt.Errorf("%w: intent is running; stop its work before deleting", ErrIntentStateConflict)
 	}
 
 	// 载入全图节点(判 protected)与边(算向下可达 + 父集)。图规模对真实任务很小。
@@ -1156,6 +1170,17 @@ func (s *ExplorationStore) HasActiveIntent() (bool, error) {
 	var exists bool
 	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM exploration_nodes
 WHERE exploration_id=$1 AND kind='intent' AND state IN ('open','running'))`, s.expID).Scan(&exists)
+	return exists, err
+}
+
+// HasPendingIntent is HasActiveIntent plus intents the user paused. A paused
+// intent is held, not finished — typically paused to send it a message — so a
+// task must not be completed while one exists: it would turn "done" under the
+// user, and the message to the paused work would then be rejected.
+func (s *ExplorationStore) HasPendingIntent() (bool, error) {
+	var exists bool
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='intent' AND state IN ('open','running','paused'))`, s.expID).Scan(&exists)
 	return exists, err
 }
 

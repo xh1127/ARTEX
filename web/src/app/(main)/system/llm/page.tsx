@@ -437,7 +437,7 @@ function ProfileSheet({
     if (saving) return;
     setSaving(true);
     try {
-      const { id } = await api.saveLLMProfile({
+      const { id, warning } = await api.saveLLMProfile({
         ...(profile ? { id: Number(profile.id) } : {}),
         name: name.trim(),
         format,
@@ -461,8 +461,10 @@ function ProfileSheet({
         user_agent: userAgent,
         retry,
       });
+      // The row is saved either way. With a warning (already shown by the API
+      // layer) the hot reload failed, so "即时生效" would be untrue — skip it.
       if (isNew) toast.success(`已新建：${name.trim()}（在卡片上「设为激活」以启用）`);
-      else toast.success(profile?.is_default ? "已保存，激活配置即时生效，无需重启" : "已保存");
+      else if (!warning) toast.success(profile?.is_default ? "已保存，激活配置即时生效，无需重启" : "已保存");
       onSaved(String(id));
       onOpenChange(false);
     } catch (e) {
@@ -657,7 +659,7 @@ function ProfileSheet({
             <Input
               id="p-api-key"
               type="password"
-              placeholder={keyHint ? `已设置（${keyHint}），留空保持不变` : "sk-…"}
+              placeholder={keyHint ? `已设置（${keyHint}），留空保持不变；改了 Base URL 需重新填写` : "sk-…"}
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
             />

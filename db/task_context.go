@@ -566,6 +566,22 @@ WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, reason, id, s.expID)
 	return err
 }
 
+// SettleIntentBlocked records a run's blocked outcome only while the intent is
+// still running — compare-and-set, like every other settlement write. The
+// unguarded SetIntentBlockedReason (kept for restoring a rollback snapshot)
+// let a run that ended after the user deleted its intent turn 'deleted' back
+// into 'blocked', and ReopenIntentsByBlockedReason then re-ran it.
+func (s *ExplorationStore) SettleIntentBlocked(id int64, reason string) (bool, error) {
+	res, err := s.db.Exec(`UPDATE exploration_nodes
+SET state='blocked', blocked_reason=NULLIF($1,''), completed_at=now()
+WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state='running'`, reason, id, s.expID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 func (s *ExplorationStore) ReopenIntentsByBlockedReason(reason string) (int64, error) {
 	res, err := s.db.Exec(`UPDATE exploration_nodes
 SET state='open', blocked_reason=NULL, completed_at=NULL

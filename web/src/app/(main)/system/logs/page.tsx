@@ -3,7 +3,7 @@
 import * as React from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { sseUrl } from "@/lib/api";
+import { http, sseUrl } from "@/lib/api";
 import { MOCK } from "@/lib/mock/enabled";
 import type { LogLine } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -87,16 +87,23 @@ export default function LogsPage() {
     setLoadingHistory(true);
     try {
       const params = minDbId > 0 ? `?before=${minDbId}&limit=200` : `?limit=200`;
-      const res = await fetch(`/api/logs/history${params}`);
-      if (!res.ok) return;
-      const data = await res.json() as { items: LogLine[]; has_more: boolean };
-      if (data.items?.length) {
+      // Through http(), which sends the Authorization header: the backend no
+      // longer accepts the artex_token cookie as an API credential (cross-site
+      // request forgery from any same-host page). Failures stay silent, as before.
+      let data: { items?: LogLine[]; has_more?: boolean } | undefined;
+      try {
+        data = await http<{ items: LogLine[]; has_more: boolean }>(`/logs/history${params}`);
+      } catch {
+        return;
+      }
+      const items = data?.items ?? [];
+      if (items.length) {
         // Assign synthetic seq numbers below current minimum to keep dedup working.
         setLines((prev) => {
           const minSeq = prev.reduce((m, l) => Math.min(m, l.seq ?? 0), 0);
-          const older = data.items.map((l, i) => ({
+          const older = items.map((l, i) => ({
             ...l,
-            seq: minSeq - data.items.length + i,
+            seq: minSeq - items.length + i,
           }));
           // Prepend, dedup by db_id, cap at 5000.
           const merged = [...older, ...prev];
@@ -110,7 +117,7 @@ export default function LogsPage() {
           return deduped.slice(-5000);
         });
       }
-      setHasMore(data.has_more ?? false);
+      setHasMore(data?.has_more ?? false);
     } finally {
       setLoadingHistory(false);
     }

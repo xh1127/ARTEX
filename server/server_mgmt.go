@@ -1848,6 +1848,14 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	// Validate the effective saved configuration before changing the database.
 	// An empty key on update keeps the stored key; inactive drafts may omit it.
+	// Keeping it is only allowed for the destination it was saved with — an edit
+	// that moves the base URL (or, with none, switches to another format's
+	// default endpoint) must re-enter the key, or the next use sends it there.
+	if p.APIKey == "" && existing != nil && existing.APIKey != "" &&
+		!sameKeyDestination(profileDestination(existing), profileDestination(&p)) {
+		writeErr(w, 400, errKeyDestinationChanged)
+		return
+	}
 	candidate := p
 	if candidate.APIKey == "" && existing != nil {
 		candidate.APIKey = existing.APIKey
@@ -1873,11 +1881,13 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	// Hot-apply. Not just when the ACTIVE profile changed: with failover on, any
 	// profile's key/model/priority/pool_exclude edit reshapes the chain, so the
 	// engine's provider has to be rebuilt either way.
+	resp := map[string]any{"id": id}
 	if err := s.reapplyActiveProfile(); err != nil {
-		writeErr(w, 500, "配置已保存，但模型客户端更新失败: "+err.Error())
-		return
+		// The row is committed: a 500 here made the UI report failure and keep the
+		// form open without an id, so retrying a create inserted a duplicate.
+		resp["warning"] = "配置已保存，但模型客户端更新失败: " + err.Error()
 	}
-	writeJSON(w, 200, map[string]any{"id": id})
+	writeJSON(w, 200, resp)
 }
 
 // pgGetLLMRetryPolicy 返回全局重试策略(五层各自的次数+间隔)。未配置过 → 全零，
@@ -1909,11 +1919,14 @@ func (s *Server) pgSaveLLMRetryPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	s.applyRetryPolicy()
 	s.invalidateProfileAgents()
+	resp := struct {
+		db.LLMRetryPolicy
+		Warning string `json:"warning,omitempty"` // committed, but the hot reload failed
+	}{LLMRetryPolicy: pg.LLMRetryPolicy()}
 	if err := s.reapplyActiveProfile(); err != nil {
-		writeErr(w, 500, "重试策略已保存，但模型客户端更新失败: "+err.Error())
-		return
+		resp.Warning = "重试策略已保存，但模型客户端更新失败: " + err.Error()
 	}
-	writeJSON(w, 200, pg.LLMRetryPolicy())
+	writeJSON(w, 200, resp)
 }
 
 func (s *Server) pgDeleteProfile(w http.ResponseWriter, r *http.Request) {
@@ -1942,11 +1955,11 @@ func (s *Server) pgDeleteProfile(w http.ResponseWriter, r *http.Request) {
 	s.restoreTasksAfterProfileDelete(pg)
 	// Cache invalidation also removed the active profile's shared provider entry.
 	// Reapply after task-state sync so the wake-up observes the post-delete chain.
+	resp := map[string]any{"deleted": id}
 	if err := s.reapplyActiveProfile(); err != nil {
-		writeErr(w, 500, "配置已删除，但模型客户端更新失败: "+err.Error())
-		return
+		resp["warning"] = "配置已删除，但模型客户端更新失败: " + err.Error()
 	}
-	writeJSON(w, 200, map[string]any{"deleted": id})
+	writeJSON(w, 200, resp)
 }
 
 func (s *Server) restoreTasksAfterProfileDelete(pg *db.DB) {
@@ -1997,11 +2010,11 @@ func (s *Server) pgActivateProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.invalidateProfileAgents() // active change may affect pinned-task fallbacks
-	if err := s.reapplyActiveProfile(); err != nil {
-		writeErr(w, 500, "配置已切换，但模型客户端初始化失败: "+err.Error())
-		return
+	resp := map[string]any{"ok": true}
+	if err := s.reapplyActiveProfile(); err != nil { // switch the running engine to the newly activated profile
+		resp["warning"] = "配置已切换，但模型客户端初始化失败: " + err.Error()
 	}
-	writeJSON(w, 200, map[string]any{"ok": true})
+	writeJSON(w, 200, resp)
 }
 
 // pgLLMPoolStatus reports the failover ("轮询") switches, the resolved chain order
@@ -2064,6 +2077,10 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	if req.ProfileID != nil && (apiKey == "" || req.UserAgent == nil) {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
 			if apiKey == "" {
+				if !sameKeyDestination(profileDestination(p), agent.ConfigFrom(req.Provider, "", req.BaseURL, "", "")) {
+					writeJSON(w, 200, map[string]any{"ok": false, "error": errKeyDestinationChanged})
+					return
+				}
 				apiKey = p.APIKey
 			}
 			if req.UserAgent == nil {

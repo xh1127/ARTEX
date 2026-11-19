@@ -110,7 +110,7 @@ func TestLLMTestSessionHeaderFallback(t *testing.T) {
 				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}`)
 			}))
 			defer upstream.Close()
-			body := map[string]any{"provider": "openai", "model": "test", "base_url": upstream.URL, "profile_id": id, "streaming": false}
+			body := map[string]any{"provider": "openai", "model": "test", "base_url": upstream.URL, "profile_id": id, "api_key": "test-key", "streaming": false}
 			if tc.include {
 				body["session_header_key"] = tc.value
 			}

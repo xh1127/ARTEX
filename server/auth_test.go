@@ -2,9 +2,16 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // GetSetting 对"键不存在"和"读取出错"的返回值只差一个 error：两种情况 value 都是
@@ -80,5 +87,137 @@ func TestValidatePassword(t *testing.T) {
 				t.Fatalf("validatePassword(%q)=%q, wantErr=%v", tc.pw, got, tc.wantErr)
 			}
 		})
+	}
+}
+
+// The artex_token cookie is written by JavaScript for the Next route guard only.
+// Accepting it as an API credential let any same-site page (another port on the
+// same host counts) forge admin requests, so only the header and ?token= count.
+func TestRequireAuthIgnoresCookieCredential(t *testing.T) {
+	s := &Server{jwtKey: []byte("cookie-csrf-test-signing-key-0123456789")}
+	tok, err := signJWT(s.jwtKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := s.requireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	call := func(r *http.Request) int {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+
+	cookieOnly := httptest.NewRequest("POST", "/api/mcp", nil)
+	cookieOnly.AddCookie(&http.Cookie{Name: "artex_token", Value: tok})
+	if code := call(cookieOnly); code != 401 {
+		t.Fatalf("cookie-only request status=%d, want 401", code)
+	}
+
+	bearer := httptest.NewRequest("GET", "/api/tasks", nil)
+	bearer.Header.Set("Authorization", "Bearer "+tok)
+	if code := call(bearer); code != 200 {
+		t.Fatalf("bearer request status=%d, want 200", code)
+	}
+	if code := call(httptest.NewRequest("GET", "/api/logs/stream?token="+tok, nil)); code != 200 {
+		t.Fatalf("?token= (EventSource) request status=%d, want 200", code)
+	}
+}
+
+// A password change (in-app, init, or reset-password.sh — all stamp updated_at)
+// must end every session issued before it; tokens are stateless and live 7 days.
+func TestPasswordChangeRevokesEarlierTokens(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	t.Cleanup(func() { m.Close() }) // registered first: the settings restore needs the pool
+	s := &Server{m: m, jwtKey: []byte("revocation-test-signing-key-0123456789")}
+	preserveRuntimeSettings(t, s, authPassKey)
+
+	hash, err := bcrypt.GenerateFromPassword([]byte("old password 123"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.pg.SetSetting(authPassKey, string(hash)); err != nil {
+		t.Fatal(err)
+	}
+	s.forgetPasswordEpoch()
+
+	stale, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+		Subject:   "ARTEX",
+		IssuedAt:  jwt.NewNumericDate(time.Now().Add(-time.Hour)),
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+	}).SignedString(s.jwtKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.checkToken(stale); got != tokenInvalid {
+		t.Fatalf("token issued before the password was set: check=%v, want invalid", got)
+	}
+	fresh, err := signJWT(s.jwtKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.checkToken(fresh); got != tokenOK {
+		t.Fatalf("token issued after the password was set: check=%v, want ok", got)
+	}
+
+	// The change endpoint revokes, and hands the caller a working replacement.
+	body := strings.NewReader(`{"old_password":"old password 123","new_password":"new password 456"}`)
+	req := httptest.NewRequest("POST", "/api/auth/change-password", body)
+	req.Header.Set("Authorization", "Bearer "+fresh)
+	w := httptest.NewRecorder()
+	s.authChangePassword(w, req)
+	var resp struct {
+		Token string `json:"token"`
+	}
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &resp) != nil || resp.Token == "" {
+		t.Fatalf("change-password status=%d body=%s", w.Code, w.Body)
+	}
+	if got := s.checkToken(resp.Token); got != tokenOK {
+		t.Fatalf("replacement token rejected: %v", got)
+	}
+	if got := s.checkToken(stale); got != tokenInvalid {
+		t.Fatalf("stale token accepted after change: %v", got)
+	}
+}
+
+// Never having read the cutoff and being unable to read it now must fail closed.
+func TestTokenCheckFailsClosedWhenEpochUnreadable(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	defer m.Close()
+	if err := m.pg.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{m: m, jwtKey: []byte("revocation-test-signing-key-0123456789")}
+	tok, err := signJWT(s.jwtKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := s.requireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	req := httptest.NewRequest("GET", "/api/tasks", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != 503 {
+		t.Fatalf("status=%d, want 503 when the password cutoff cannot be read", w.Code)
+	}
+}
+
+// /api/auth/* runs before authentication: the caller must not choose how much
+// the server reads into memory.
+func TestAuthRoutesCapRequestBody(t *testing.T) {
+	s := &Server{jwtKey: []byte("body-cap-test-signing-key-0123456789")}
+	var readErr error
+	h := s.requireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, readErr = io.Copy(io.Discard, r.Body)
+	}))
+	huge := strings.NewReader(`{"password":"` + strings.Repeat("a", authBodyLimit*4) + `"}`)
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/api/auth/login", huge))
+	var tooLarge *http.MaxBytesError
+	if !errors.As(readErr, &tooLarge) {
+		t.Fatalf("oversized unauthenticated body read without a cap: err=%v", readErr)
 	}
 }

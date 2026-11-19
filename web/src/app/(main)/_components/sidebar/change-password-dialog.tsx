@@ -16,6 +16,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { api } from "@/lib/api";
+import { auth } from "@/lib/auth";
 
 export function ChangePasswordDialog({
   open,
@@ -51,8 +52,11 @@ export function ChangePasswordDialog({
     setSaving(true);
     api
       .changePassword(oldPassword, newPassword)
-      .then(() => {
-        toast.success("密码已修改");
+      .then(({ token }) => {
+        // The change ends every session issued before it, this one included;
+        // the server hands back a fresh token so this tab stays signed in.
+        if (token) auth.setToken(token);
+        toast.success("密码已修改，其它设备上的登录已失效");
         onOpenChange(false);
       })
       .catch((err) => toast.error(`修改失败：${(err as Error).message}`))
@@ -66,7 +70,8 @@ export function ChangePasswordDialog({
           <DialogHeader>
             <DialogTitle>修改密码</DialogTitle>
             <DialogDescription>
-              用户名固定为 <b>ARTEX</b>。需先输入当前密码验证；修改后已签发的登录 token 仍有效直至过期。
+              用户名固定为 <b>ARTEX</b>。需先输入当前密码验证；修改后，此前签发的所有登录 token
+              立即失效（当前页面会自动续用新 token）。
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-3 py-4">

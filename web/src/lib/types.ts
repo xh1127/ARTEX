@@ -1246,6 +1246,9 @@ export interface Stats {
   assets: number;
   engine_mode: EngineMode;
   llm_configured: boolean;
+  // Non-empty when a config is set but cannot be built (e.g. an invalid proxy or
+  // User-Agent): "配置无效" rather than "未配置", with the reason.
+  llm_error?: string;
   roe_enabled: boolean;
   findings_confirmed: number;
   active_task?: Partial<Task>;

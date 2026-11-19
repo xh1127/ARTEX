@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -27,6 +28,9 @@ const (
 	// ErrPasswordTooLong，提前挡掉好过让用户收到一句含义不明的「密码加密失败」。
 	minPasswordRunes = 8
 	maxPasswordBytes = 72
+
+	// authBodyLimit caps request bodies on the unauthenticated /api/auth/* routes.
+	authBodyLimit = 8 << 10
 )
 
 // errDataSourceUnavailable 是密码相关读操作失败时统一的回复。这些 handler 绝不能
@@ -92,25 +96,113 @@ func signJWT(key []byte) (string, error) {
 	}).SignedString(key)
 }
 
-// verifyJWT returns true when tokenStr is a valid, non-expired HS256 token.
-func verifyJWT(tokenStr string, key []byte) bool {
-	t, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
+// parseJWT returns the claims of a valid, non-expired HS256 token signed with key.
+func parseJWT(tokenStr string, key []byte) (*jwt.RegisteredClaims, bool) {
+	claims := &jwt.RegisteredClaims{}
+	t, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method")
 		}
 		return key, nil
 	})
-	return err == nil && t.Valid
+	if err != nil || !t.Valid {
+		return nil, false
+	}
+	return claims, true
 }
 
-// extractToken reads the JWT from Authorization: Bearer header,
-// artex_token cookie, or ?token= query param (for SSE connections).
+// A password change must end every session issued before it: tokens are
+// stateless and live 7 days, so otherwise a leaked one kept working after the
+// admin changed or reset the password. The cutoff is the password row's
+// updated_at, which every write path stamps — the in-app change, first-run init
+// and reset-password.sh alike — so no path needs extra bookkeeping.
+const (
+	// pwEpochTTL bounds how long an out-of-process reset (reset-password.sh) can
+	// go unnoticed. In-process changes invalidate the cache immediately.
+	pwEpochTTL = 5 * time.Second
+	// pwEpochSkew absorbs clock skew between the database (updated_at) and this
+	// process (iat) plus iat's one-second truncation, so a token issued right
+	// after a change is never rejected.
+	pwEpochSkew = 5 * time.Second
+)
+
+type pwEpochCache struct {
+	mu     sync.Mutex
+	at     time.Time // last password write; zero = no password yet
+	loaded time.Time
+	valid  bool
+}
+
+type tokenCheck int
+
+const (
+	tokenOK tokenCheck = iota
+	tokenInvalid
+	tokenUnverifiable // the password epoch could not be read; fail closed
+)
+
+// passwordChangedAt returns when the admin password was last written (cached).
+// ok=false only when it has never been loaded and the database cannot answer.
+func (s *Server) passwordChangedAt() (at time.Time, ok bool) {
+	if s.m == nil || s.m.pg == nil {
+		return time.Time{}, true // no data source: nothing to compare against
+	}
+	c := &s.pwEpoch
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.valid && time.Since(c.loaded) < pwEpochTTL {
+		return c.at, true
+	}
+	at, _, err := s.m.pg.SettingUpdatedAt(authPassKey)
+	if err != nil {
+		if c.valid {
+			return c.at, true // transient error: keep enforcing the last known cutoff
+		}
+		return time.Time{}, false
+	}
+	c.at, c.loaded, c.valid = at, time.Now(), true
+	return at, true
+}
+
+// forgetPasswordEpoch drops the cache after an in-process password write.
+func (s *Server) forgetPasswordEpoch() {
+	s.pwEpoch.mu.Lock()
+	s.pwEpoch.valid = false
+	s.pwEpoch.mu.Unlock()
+}
+
+// checkToken validates signature and expiry, then rejects tokens issued before
+// the current password was set.
+func (s *Server) checkToken(tokenStr string) tokenCheck {
+	claims, ok := parseJWT(tokenStr, s.jwtKey)
+	if !ok {
+		return tokenInvalid
+	}
+	changedAt, ok := s.passwordChangedAt()
+	if !ok {
+		return tokenUnverifiable
+	}
+	if changedAt.IsZero() {
+		return tokenOK
+	}
+	if claims.IssuedAt == nil || claims.IssuedAt.Time.Before(changedAt.Add(-pwEpochSkew)) {
+		return tokenInvalid
+	}
+	return tokenOK
+}
+
+// extractToken reads the JWT from the Authorization: Bearer header, or the
+// ?token= query param (EventSource cannot set headers).
+//
+// The artex_token cookie is deliberately NOT a credential. The UI writes it from
+// JavaScript (so it can't be HttpOnly) only for the Next route guard, and sends
+// the Authorization header on every API call. Accepting it here let any page on
+// the same host — a different port counts as same-site, e.g. an HTTP server an
+// agent started — make the browser attach it to a no-preflight POST and drive the
+// API as the admin (cross-site request forgery).
 func extractToken(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		return strings.TrimPrefix(h, "Bearer ")
-	}
-	if c, err := r.Cookie("artex_token"); err == nil && c.Value != "" {
-		return c.Value
 	}
 	return r.URL.Query().Get("token")
 }
@@ -121,6 +213,10 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		if strings.HasPrefix(p, "/api/auth/") || p == "/api/health" {
+			// These run before any authentication, so an unauthenticated caller
+			// controls the body size; a multi-GB "password" was read into memory.
+			// The largest legitimate body (change-password) is well under 1 KiB.
+			r.Body = http.MaxBytesReader(w, r.Body, authBodyLimit)
 			h.ServeHTTP(w, r)
 			return
 		}
@@ -129,7 +225,12 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			writeErr(w, 401, "未授权")
 			return
 		}
-		if !verifyJWT(tok, s.jwtKey) {
+		switch s.checkToken(tok) {
+		case tokenOK:
+		case tokenUnverifiable:
+			writeErr(w, 503, errDataSourceUnavailable)
+			return
+		default:
 			writeErr(w, 401, "token 无效或已过期")
 			return
 		}
@@ -151,10 +252,14 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, errDataSourceUnavailable)
 		return
 	}
+	if hash == "" {
+		s.setup.announce() // idempotent; covers a database that was down at startup
+	}
 	writeJSON(w, 200, map[string]any{"initialized": hash != ""})
 }
 
-// POST /api/auth/init — sets the password for the first time; rejected if already set.
+// POST /api/auth/init — sets the password for the first time; rejected if already
+// set, and without the one-time setup token (see setupGate).
 func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
@@ -170,10 +275,16 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Password string `json:"password"`
+		Password   string `json:"password"`
+		SetupToken string `json:"setup_token"`
 	}
 	if err := decode(r, &req); err != nil || req.Password == "" {
 		writeErr(w, 400, "密码不能为空")
+		return
+	}
+	// Checked before bcrypt so an unauthenticated caller can't make us burn CPU.
+	if !s.setup.matches(req.SetupToken) {
+		writeErr(w, 403, "初始化令牌不正确：请查看服务启动日志，或程序目录下的 setup-token 文件")
 		return
 	}
 	if msg := validatePassword(req.Password); msg != "" {
@@ -197,6 +308,8 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码已设置")
 		return
 	}
+	s.setup.retire()
+	s.forgetPasswordEpoch()
 	tok, err := signJWT(s.jwtKey)
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
@@ -213,7 +326,12 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	switch s.checkToken(extractToken(r)) {
+	case tokenOK:
+	case tokenUnverifiable:
+		writeErr(w, 503, errDataSourceUnavailable)
+		return
+	default:
 		writeErr(w, 401, "未授权")
 		return
 	}
@@ -255,7 +373,15 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "保存失败: "+err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true})
+	// Every token issued before this write is now rejected (checkToken), the
+	// caller's included — hand it a fresh one so this session carries on.
+	s.forgetPasswordEpoch()
+	tok, err := signJWT(s.jwtKey)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": true})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "token": tok})
 }
 
 // POST /api/auth/login — validates username/password and returns a JWT.

@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"reflect"
@@ -419,8 +421,31 @@ func TestSaveProfileReportsReapplyFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := callUserAgentHandler(t, s.pgSaveProfile, map[string]any{"id": id, "name": t.Name() + "-other", "format": "openai", "model": "new-model"})
-	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "已保存") {
-		t.Fatalf("hot reload failure hidden: status=%d body=%s", w.Code, w.Body)
+	// Committed but not hot-applied: a 200 carrying a warning. A 500 made the UI
+	// treat the save as failed — the failure must stay visible, not be fatal.
+	var resp struct {
+		ID      int64  `json:"id"`
+		Warning string `json:"warning"`
+	}
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &resp) != nil || resp.ID != id || !strings.Contains(resp.Warning, "已保存") {
+		t.Fatalf("hot reload failure hidden or reported as failed save: status=%d body=%s", w.Code, w.Body)
+	}
+	if p, err := s.m.pg.ProfileByID(id); err != nil || p == nil || p.Model != "new-model" {
+		t.Fatalf("edit was not committed: %+v %v", p, err)
+	}
+
+	// Create path: the response must carry the new id, otherwise the client keeps
+	// an id-less form and a retry inserts a second row.
+	w = callUserAgentHandler(t, s.pgSaveProfile, map[string]any{"name": t.Name() + "-new", "format": "openai", "model": "m", "api_key": "k"})
+	resp.ID, resp.Warning = 0, ""
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.ID > 0 {
+		t.Cleanup(func() { _, _ = s.m.pg.Exec(`DELETE FROM llm_profiles WHERE id=$1`, resp.ID) })
+	}
+	if w.Code != http.StatusOK || resp.ID <= 0 || !strings.Contains(resp.Warning, "已保存") {
+		t.Fatalf("create with failed hot reload: status=%d body=%s", w.Code, w.Body)
 	}
 }
 
@@ -525,5 +550,41 @@ func TestSettingsCommitPatchAndRebuildPool(t *testing.T) {
 	on, backend, key, _, _ := s.m.WebSearch()
 	if w.Code != 200 || on || backend != "brave-free" || key != "test-key" {
 		t.Fatalf("partial patch lost search settings: status=%d on=%v backend=%q", w.Code, on, backend)
+	}
+}
+
+// A config that is set but cannot be built used to surface only as
+// configured:false — indistinguishable from "nothing configured".
+func TestLLMBuildFailureReasonIsReported(t *testing.T) {
+	s, activeID := newProfileRuntimeTestServer(t)
+	read := func() (bool, string) {
+		w := httptest.NewRecorder()
+		s.getLLM(w, httptest.NewRequest("GET", "/api/llm", nil))
+		var r struct {
+			Configured bool   `json:"configured"`
+			Error      string `json:"error"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &r); err != nil {
+			t.Fatal(err)
+		}
+		return r.Configured, r.Error
+	}
+	if _, err := s.m.pg.Exec(`UPDATE llm_profiles SET proxy='ftp://invalid.example' WHERE id=$1`, activeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.reapplyActiveProfile(); err == nil {
+		t.Fatal("an invalid active profile was applied")
+	}
+	if on, reason := read(); on || reason == "" {
+		t.Fatalf("configured=%v error=%q, want false with the build failure reason", on, reason)
+	}
+	if _, err := s.m.pg.Exec(`UPDATE llm_profiles SET proxy=NULL WHERE id=$1`, activeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.reapplyActiveProfile(); err != nil {
+		t.Fatal(err)
+	}
+	if on, reason := read(); !on || reason != "" {
+		t.Fatalf("after the fix: configured=%v error=%q, want true and no error", on, reason)
 	}
 }

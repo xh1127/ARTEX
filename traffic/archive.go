@@ -162,13 +162,11 @@ func (t *Traffic) ImportArchive(dir string) (int64, error) {
 			return 0, fmt.Errorf("traffic blob checksum mismatch: %s", hash)
 		}
 		destination := filepath.Join(t.dir, "_blobs", "sha256", hash[:2], hash+".bin")
-		if _, err := os.Stat(destination); os.IsNotExist(err) {
-			if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
-				return 0, err
-			}
-			if err := os.WriteFile(destination, data, 0o644); err != nil {
-				return 0, err
-			}
+		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+			return 0, err
+		}
+		if err := ensureBlob(destination, data); err != nil {
+			return 0, err
 		}
 	}
 	tx, err := t.db.Begin()

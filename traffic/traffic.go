@@ -174,8 +174,15 @@ type Traffic struct {
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
 func Open(dir, addr string) (*Traffic, error) {
-	for _, d := range []string{dir, filepath.Join(dir, "_index"), filepath.Join(dir, "_blobs"), filepath.Join(dir, "_ca")} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
+	// _index (SQLite, holds captured cookies/Authorization headers) and _blobs are
+	// private to this user. _ca stays traversable: its public certificate is what
+	// clients import to trust the proxy — only the private key is locked down (see
+	// restrictCapturePerms).
+	for _, d := range []struct {
+		path string
+		perm os.FileMode
+	}{{dir, 0o755}, {filepath.Join(dir, "_index"), 0o700}, {filepath.Join(dir, "_blobs"), 0o700}, {filepath.Join(dir, "_ca"), 0o755}} {
+		if err := os.MkdirAll(d.path, d.perm); err != nil {
 			return nil, err
 		}
 	}
@@ -210,6 +217,7 @@ func Open(dir, addr string) (*Traffic, error) {
 		db.Close()
 		return nil, err
 	}
+	restrictCapturePerms(dir)
 	// Upstream selection. By default (no global egress proxy set) targets are
 	// dialed DIRECTLY: go-mitmproxy's own default upstream uses
 	// http.ProxyFromEnvironment, so an HTTP_PROXY/HTTPS_PROXY in the environment
@@ -543,16 +551,14 @@ func (t *Traffic) spill(body []byte, contentType string) storedBody {
 	// One bucket level (256 buckets) is enough to keep any single directory small;
 	// the store only ever holds bodies above maxInlineBody, deduplicated by hash.
 	blobDir := filepath.Join(t.dir, "_blobs", "sha256", h[:2])
-	if err := os.MkdirAll(blobDir, 0o755); err != nil {
+	if err := os.MkdirAll(blobDir, 0o700); err != nil {
 		log.Printf("[traffic] 创建 blob 目录失败：%v", err)
 		return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
 	}
 	blobPath := filepath.Join(blobDir, h+".bin")
-	if _, err := os.Stat(blobPath); os.IsNotExist(err) {
-		if err := os.WriteFile(blobPath, body, 0o644); err != nil {
-			log.Printf("[traffic] 写 blob %s 失败：%v", h, err)
-			return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
-		}
+	if err := ensureBlob(blobPath, body); err != nil {
+		log.Printf("[traffic] 写 blob %s 失败：%v", h, err)
+		return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
 	}
 	sb := storedBody{hash: h, index: indexText()}
 	if text {

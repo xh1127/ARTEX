@@ -54,6 +54,9 @@ func TestConnectionTestMaxTokensField(t *testing.T) {
 				body["api_key"] = "test-key"
 			} else {
 				body["profile_id"] = id
+				// The upstream is a different host than the stored profile, so the stored
+				// key is (correctly) not lent to it; this case tests the field fallback.
+				body["api_key"] = "test-key"
 			}
 			if tc.include {
 				body["max_tokens_field"] = tc.value

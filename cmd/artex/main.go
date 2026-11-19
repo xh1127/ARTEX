@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -51,12 +52,27 @@ func main() {
 }
 
 func run() int {
+	// ContinueOnError instead of the default ExitOnError: a bad flag used to exit
+	// here, before selfupdate.Bootstrap counts the boot attempt. A release that
+	// renames or drops a flag the start script still passes ("$@") therefore
+	// failed on every launch without ever triggering the rollback to artex.old.
+	flag.CommandLine.Init(os.Args[0], flag.ContinueOnError)
 	var (
 		addr    = flag.String("addr", ":8787", "HTTP listen address")
 		dataDir = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
 		proxy   = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
 	)
-	flag.Parse()
+	if err := flag.CommandLine.Parse(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0 // -h: usage already printed; no bootstrap side effects (the update smoke test runs this)
+		}
+		// The error and usage are already printed. Count this as a failed boot
+		// so a broken update still rolls back after repeated failures.
+		if action, _ := selfupdate.Bootstrap(); action == selfupdate.Restart {
+			return selfupdate.ExitRestart
+		}
+		return 2 // same code ExitOnError used
+	}
 
 	// hand the build version to the server package so GET /api/health can report it
 	// to the frontend top bar.

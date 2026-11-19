@@ -73,7 +73,10 @@ func TestIsBlockedDialIP(t *testing.T) {
 		"169.254.1.1", "fe80::1",
 		"0.0.0.0", "::",
 		"224.0.0.1", "ff02::1",
-		"::ffff:127.0.0.1", // IPv4-mapped 形式必须还原后再判，否则是绕过口
+		"::ffff:127.0.0.1",                          // IPv4-mapped 形式必须还原后再判，否则是绕过口
+		"100.100.100.200", "::ffff:100.100.100.200", // 阿里云元数据，CGNAT 段不在链路本地内
+		"fd00:ec2::254", // AWS IMDS IPv6
+		"168.63.129.16", // Azure WireServer
 		"",
 	}
 	for _, s := range blocked {
@@ -84,7 +87,8 @@ func TestIsBlockedDialIP(t *testing.T) {
 	// RFC1918 私网**刻意放行**：内网自建 Mattermost / SMTP 中继是常见合法用法。
 	// 这条断言把这个取舍固定下来——若将来有人顺手加上私网判断，这里会失败，
 	// 从而逼出一次有意识的决定（而不是静默废掉一批部署）。
-	allowed := []string{"10.0.0.5", "172.16.3.4", "192.168.1.10", "8.8.8.8", "2606:4700::1111"}
+	allowed := []string{"10.0.0.5", "172.16.3.4", "192.168.1.10", "8.8.8.8", "2606:4700::1111",
+		"100.100.100.199", "fd00:ec2::253"} // 只拦精确的元数据地址，同网段其它地址照常放行
 	for _, s := range allowed {
 		if isBlockedDialIP(net.ParseIP(s)) {
 			t.Errorf("%s 应被放行（私网是常见的合法投递目标）", s)
@@ -189,5 +193,21 @@ func TestEmailDialGuardAllowsLoopbackWhenOptedIn(t *testing.T) {
 	}
 	if !f.sawCommand("EHLO") {
 		t.Fatal("未看到 EHLO——会话没真正建立")
+	}
+}
+
+// The dial guard checks the address actually dialed. With an environment proxy
+// that is the proxy, never the delivery target: a local proxy (127.0.0.1:7890)
+// made every delivery fail as "to localhost", and a remote one hid targets such
+// as 169.254.169.254 from the guard entirely. Deliveries must connect directly.
+func TestNotifyTransportIgnoresEnvironmentProxy(t *testing.T) {
+	if notifyTransport.Proxy != nil {
+		t.Fatal("notifyTransport must not use a proxy (ProxyFromEnvironment defeats the dial guard)")
+	}
+	if notifyTransport.DialContext == nil {
+		t.Fatal("notifyTransport lost its guarded dialer")
+	}
+	if httpClient.Transport != notifyTransport {
+		t.Fatal("httpClient must deliver through the guarded transport")
 	}
 }

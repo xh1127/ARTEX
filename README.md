@@ -81,6 +81,8 @@ cd ARTEX
 
 装好后打开 **http://localhost:8787**（首次进入 `/setup` 设置管理员密码）。
 
+> **初始化令牌**：设置密码前需要填一个一次性令牌，防止别人抢在你之前初始化这台实例（服务默认监听所有网卡）。令牌在首次启动时打印在服务日志里，并写入程序目录下的 `setup-token` 文件；Docker 部署可用 `docker compose logs artex | grep 初始化令牌` 查看。密码设置成功后令牌自动作废、文件自动删除。
+
 ### 方式二：Docker Compose（手动）
 
 ```bash
@@ -222,7 +224,9 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 
 **并发**：每个任务的 work agent 数在「系统设置」里配置（默认 3）。
 
-**常用参数**：`./start.sh -addr :8787 -proxy :8788`（`-addr` 前端+API，`-proxy` 流量录制代理）。启动脚本会把参数原样透传给 `artex`。
+**常用参数**：`./start.sh -addr :8787 -proxy 127.0.0.1:8788`（`-addr` 前端+API，`-proxy` 流量录制代理）。启动脚本会把参数原样透传给 `artex`。
+
+> ⚠️ 录制代理**没有认证**。`-proxy` 默认只监听 `127.0.0.1`；不要写成 `-proxy :8788`（监听所有网卡），否则同网段的任何人都能把这台机器当跳板访问它能到达的内网与本机服务，还能往流量记录里塞伪造的请求。Docker 部署的 `docker-compose.yml` 已把 8788 只映射到宿主机 `127.0.0.1`，自行 `docker run` 时也请写 `-p 127.0.0.1:8788:8788`。
 
 ### 反向代理部署（HTTPS / 只开放 443）
 
